@@ -13,7 +13,8 @@ runs on your machine. No accounts, no API keys, nothing leaves the Mac.
 
 ## Install
 
-Download `Narrate-<version>-arm64.dmg`, open it, drag **Narrate** onto **Applications**. Done — the
+**[Download Narrate.dmg](https://github.com/Ephemerill/pdf-to-speach/releases/latest/download/Narrate.dmg)**
+(all versions: [Releases](https://github.com/Ephemerill/pdf-to-speach/releases)), open it, drag **Narrate** onto **Applications**. Done — the
 app is self-contained (a Swift/SwiftUI front end with a relocatable Python runtime and the Kokoro
 engine embedded in the bundle); nobody needs Python installed.
 
@@ -36,6 +37,15 @@ Requires macOS 15+ and an Apple Silicon Mac (an Intel build can be made with `AR
 Needs Xcode (or the Command Line Tools) for `swiftc`; there is no Xcode project, the script compiles
 the sources directly. The first full build downloads a relocatable Python and the engine's wheels
 into `build/` (cached afterwards).
+
+**Publishing a release:** `dist/` is not committed (an 80 MB binary doesn't belong in git history).
+Instead, push a version tag and GitHub builds and attaches the DMG for you:
+
+```sh
+git tag v2.1 && git push origin v2.1      # → github.com/…/releases/tag/v2.1 with Narrate.dmg
+```
+
+(`.github/workflows/release.yml`; *Actions ▸ Release ▸ Run workflow* builds a DMG without releasing.)
 
 **Shipping without the Gatekeeper prompt** needs the Apple Developer Program:
 

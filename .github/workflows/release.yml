@@ -1,0 +1,58 @@
+# Builds Narrate.dmg on a Mac runner and publishes it as a GitHub Release.
+#
+#   git tag v2.1 && git push origin v2.1     → release "Narrate v2.1" with the DMG attached
+#   Actions ▸ Release ▸ Run workflow          → just builds the DMG (downloadable as an artifact)
+#
+# Signing/notarization: add SIGN_IDENTITY / NOTARY_PROFILE support by importing a Developer ID
+# certificate into the runner keychain (see README "Shipping without the Gatekeeper prompt").
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15          # Apple Silicon runner with Xcode preinstalled
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache embedded Python + wheels
+        uses: actions/cache@v4
+        with:
+          path: build/python-arm64
+          key: python-arm64-${{ hashFiles('engine/requirements.txt', 'build.sh') }}
+
+      - name: Build disk image
+        run: ./build.sh --dmg
+
+      - name: Keep a stable file name for the "latest" link
+        run: cp dist/Narrate-*-arm64.dmg dist/Narrate.dmg
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Narrate-dmg
+          path: dist/*.dmg
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Install
+          Download **Narrate.dmg** below, open it, and drag Narrate onto Applications. Apple Silicon, macOS 15+.
+
+          First launch downloads the voice model (≈340 MB, once). Everything runs on your Mac; nothing leaves it.
+
+          **First open:** macOS will say *"Apple could not verify Narrate is free of malware"* because this build
+          isn't notarized yet. Click **Done**, open **System Settings ▸ Privacy & Security**, scroll down and click
+          **Open Anyway**. You only do this once.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/Narrate-*-arm64.dmg dist/Narrate.dmg \
+            --title "Narrate $GITHUB_REF_NAME" --notes-file notes.md --generate-notes
