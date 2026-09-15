@@ -1,0 +1,9 @@
+.venv/
+models/
+__pycache__/
+*.pyc
+samples/*.mp3
+samples/*.m4a
+samples/*.wav
+samples/*.narrate.json
+.DS_Store
