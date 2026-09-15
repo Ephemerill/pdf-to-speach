@@ -13,21 +13,39 @@ runs on your machine. No accounts, no API keys, nothing leaves the Mac.
 
 ## Install
 
-```sh
-./build.sh          # → dist/Narrate.app
-```
-
-Then double-click `dist/Narrate.app` (or drag it to `/Applications`). That's it — the app is
-self-contained: a Swift/SwiftUI front end with a relocatable Python runtime and the Kokoro
-engine embedded inside the bundle. Nobody needs Python installed.
+Download `Narrate-<version>-arm64.dmg`, open it, drag **Narrate** onto **Applications**. Done — the
+app is self-contained (a Swift/SwiftUI front end with a relocatable Python runtime and the Kokoro
+engine embedded in the bundle); nobody needs Python installed.
 
 First launch downloads the voice model (≈340 MB, once) into `~/Library/Application Support/Narrate/`.
-Requires macOS 15+. `ffmpeg` (Homebrew) is optional — it enables M4A and slightly better MP3s.
+Requires macOS 15+ and an Apple Silicon Mac (an Intel build can be made with `ARCH=x86_64`).
+`ffmpeg` (Homebrew) is optional — it enables M4A and slightly better MP3s.
 
-Building needs Xcode (or the Command Line Tools) for `swiftc`; there is no Xcode project, the
-build script compiles the sources directly. `./build.sh --swift` rebuilds just the Swift side.
-The build is ad-hoc signed, so it runs on the Mac that built it; distributing it to other Macs
-without Gatekeeper warnings needs a Developer ID signature + notarization.
+> **Until the app is signed with a Developer ID and notarized**, macOS shows *"Apple could not
+> verify Narrate is free of malware"* on first open. Click **Done**, then go to
+> **System Settings ▸ Privacy & Security**, scroll down and click **Open Anyway**. Once.
+
+## Build
+
+```sh
+./build.sh            # → dist/Narrate.app           (what you run while developing)
+./build.sh --swift    #   rebuild just the Swift side (seconds)
+./build.sh --dmg      # → dist/Narrate-2.0-arm64.dmg  (what you give to people)
+```
+
+Needs Xcode (or the Command Line Tools) for `swiftc`; there is no Xcode project, the script compiles
+the sources directly. The first full build downloads a relocatable Python and the engine's wheels
+into `build/` (cached afterwards).
+
+**Shipping without the Gatekeeper prompt** needs the Apple Developer Program:
+
+1. In Xcode ▸ Settings ▸ Accounts, create a *Developer ID Application* certificate.
+2. Make an app-specific password at appleid.apple.com and store it once:
+   `xcrun notarytool store-credentials narrate --apple-id you@example.com --team-id TEAMID`
+3. Build: `SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" NOTARY_PROFILE=narrate ./build.sh --dmg`
+
+That signs every binary with the hardened runtime, has Apple notarize the app and the disk image,
+and staples the tickets — the DMG then opens on any Mac with no warnings.
 
 ## Using it
 
