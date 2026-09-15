@@ -15,6 +15,7 @@ chunk (a WAV file the app can play immediately) in whatever order the app asked 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -79,8 +80,10 @@ class Engine:
 
     # -- ops ----------------------------------------------------------------
     def op_hello(self, req):
+        # sample_key changes whenever the sample script does, so the app can drop stale cached previews.
         return {"version": 2, "ffmpeg": bool(tts.ffmpeg()), "model_ready": tts.model_ready(),
-                "voices": [v.__dict__ for v in tts.VOICES]}
+                "voices": [v.__dict__ for v in tts.VOICES],
+                "sample_key": hashlib.sha1(tts.SAMPLE_TEXT.encode()).hexdigest()[:10]}
 
     def op_warm_up(self, req):
         self.tts.warm_up()

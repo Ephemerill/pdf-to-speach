@@ -203,10 +203,13 @@ final class SamplePlayer: NSObject, AVAudioPlayerDelegate {
     private(set) var playingID: String?
     private var audio: AVAudioPlayer?
 
-    func play(url: URL, id: String) throws {
+    /// Samples are rendered once at 1× and time-stretched here, so previews are instant at any speed.
+    func play(url: URL, id: String, rate: Double = 1) throws {
         audio?.stop()
         let p = try AVAudioPlayer(contentsOf: url)
         p.delegate = self
+        p.enableRate = true
+        p.rate = Float(min(2, max(0.5, rate)))
         p.play()
         audio = p
         playingID = id

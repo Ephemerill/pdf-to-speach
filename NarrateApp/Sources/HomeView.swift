@@ -5,6 +5,11 @@ struct HomeView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
     @State private var isDropTargeted = false
+    @State private var showOptions = false
+
+    private var speedLabel: String {
+        String(format: "%.2f×", model.speed).replacingOccurrences(of: "0×", with: "×")
+    }
 
     var body: some View {
         @Bindable var model = model
@@ -29,36 +34,37 @@ struct HomeView: View {
 
                 if let doc = model.document { DocumentCard(doc: doc) }
 
-                Section("Voice") {
-                    ForEach(Voice.all) { voice in
-                        VoiceRow(voice: voice, selected: voice.id == model.voiceID,
-                                 isPlaying: model.samplePlayer.playingID == voice.id,
-                                 isLoading: model.loadingSampleID == voice.id,
-                                 select: { model.voiceID = voice.id },
-                                 sample: { model.sampleVoice(voice.id) })
-                    }
-                }
+                Section("Voice") { VoicePickerRow() }
 
-                Section("Options") {
-                    LabeledContent("Speed") {
-                        HStack(spacing: 10) {
-                            Slider(value: $model.speed, in: 0.7...2.0, step: 0.05).frame(maxWidth: 220)
-                            Text(String(format: "%.2f×", model.speed).replacingOccurrences(of: "0×", with: "×"))
-                                .monospacedDigit().foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
+                // 1× MP3 is what nearly everyone wants, so these stay folded away until needed.
+                Section {
+                    DisclosureGroup(isExpanded: $showOptions) {
+                        LabeledContent("Speed") {
+                            HStack(spacing: 10) {
+                                Slider(value: $model.speed, in: 0.7...2.0, step: 0.05).frame(maxWidth: 220)
+                                Text(speedLabel).monospacedDigit().foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
+                            }
+                        }
+                        Picker("Format", selection: $model.format) {
+                            ForEach(model.formats, id: \.self) { Text($0.uppercased()).tag($0) }
+                        }
+                        .pickerStyle(.segmented).frame(maxWidth: 220)
+                    } label: {
+                        HStack {
+                            Text("Options")
+                            Spacer()
+                            if !showOptions {
+                                Text("\(speedLabel) · \(model.format.uppercased())").foregroundStyle(.secondary).monospacedDigit()
+                            }
                         }
                     }
-                    Picker("Format", selection: $model.format) {
-                        ForEach(model.formats, id: \.self) { Text($0.uppercased()).tag($0) }
-                    }
-                    .pickerStyle(.segmented).frame(maxWidth: 220)
                 }
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
-
-            Divider()
-            footer
+            .contentMargins(.bottom, 96, for: .scrollContent)   // room to scroll clear of the floating action
         }
+        .overlay(alignment: .bottom) { footer }
         .background(.background)
         .dropDestination(for: URL.self) { urls, _ in
             model.open(urls); return true
@@ -66,7 +72,7 @@ struct HomeView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) { StatusPill(status: model.status) }
         }
-        .overlay(alignment: .bottom) { ToastView(toast: model.toast).padding(.bottom, 88) }
+        .overlay(alignment: .bottom) { ToastView(toast: model.toast).padding(.bottom, 100) }
         .sheet(isPresented: .constant(isSetupSheetShown)) { SetupSheet() }
     }
 
@@ -154,8 +160,9 @@ struct HomeView: View {
 
     // MARK: Footer
 
+    /// Floats over the form: a glass progress card while generating, the primary action otherwise.
     private var footer: some View {
-        VStack(spacing: 10) {
+        Group {
             if model.isGenerating {
                 VStack(spacing: 6) {
                     if let label = model.progress.label {
@@ -174,19 +181,25 @@ struct HomeView: View {
                 }
                 .font(.callout).foregroundStyle(.secondary)
                 .controlSize(.small)
+                .padding(.horizontal, 16).padding(.vertical, 12)
+                .frame(maxWidth: 520)
+                .glassPanel(cornerRadius: 16)
             } else {
                 Button {
                     model.generate()
                 } label: {
-                    Label("Generate Audiobook", systemImage: "waveform").frame(maxWidth: .infinity)
+                    Label("Generate Audiobook", systemImage: "waveform")
+                        .font(.body.weight(.semibold))
+                        .padding(.horizontal, 12).padding(.vertical, 2)
+                        .frame(maxWidth: 400)
                 }
-                .buttonStyle(.borderedProminent).controlSize(.large)
+                .prominentGlassButton().controlSize(.large)
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(!model.canGenerate)
             }
         }
-        .padding(.horizontal, 20).padding(.vertical, 14)
-        .background(.bar)
+        .padding(.horizontal, 20).padding(.bottom, 18)
+        .animation(.snappy, value: model.isGenerating)
     }
 }
 
@@ -236,60 +249,98 @@ struct DocumentCard: View {
     }
 }
 
-struct VoiceRow: View {
-    let voice: Voice
-    let selected: Bool
-    let isPlaying: Bool
-    let isLoading: Bool
-    let select: () -> Void
-    let sample: () -> Void
+/// The chosen voice with a preview button; every other voice is one menu away instead of a long list.
+struct VoicePickerRow: View {
+    @Environment(AppModel.self) private var model
     @State private var hovering = false
 
     var body: some View {
+        @Bindable var model = model
+        let voice = Voice.named(model.voiceID)
+        let isPlaying = model.samplePlayer.playingID == voice.id
+        let isLoading = model.loadingSampleID == voice.id
         HStack(spacing: 12) {
-            ZStack {
-                Circle().fill(avatarGradient)
-                Text(String(voice.name.prefix(1))).font(.system(size: 14, weight: .semibold, design: .rounded)).foregroundStyle(.white)
-            }
-            .frame(width: 30, height: 30)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(voice.name).fontWeight(selected ? .semibold : .medium)
-                    Text(voice.accent).font(.caption2).foregroundStyle(.tertiary)
-                    Text(voice.grade).font(.system(size: 9.5, weight: .medium))
-                        .padding(.horizontal, 4).padding(.vertical, 1)
-                        .background(voice.grade.hasPrefix("A") ? Color.green.opacity(0.18) : Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 3))
-                        .foregroundStyle(voice.grade.hasPrefix("A") ? Color.green : Color.secondary)
+            Menu {
+                ForEach(["US", "UK"], id: \.self) { accent in
+                    Section(accent == "US" ? "American" : "British") {
+                        Picker("Voice", selection: $model.voiceID) {
+                            ForEach(Voice.all.filter { $0.accent == accent }) { v in
+                                Text("\(v.name)  ·  \(v.note)").tag(v.id)
+                            }
+                        }
+                        .pickerStyle(.inline).labelsHidden()
+                    }
                 }
-                Text(voice.note).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            } label: {
+                HStack(spacing: 12) {
+                    VoiceAvatar(voice: voice)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(voice.name).fontWeight(.semibold)
+                            Text(voice.accent == "US" ? "American" : "British").font(.caption2).foregroundStyle(.tertiary)
+                            GradeBadge(grade: voice.grade)
+                        }
+                        Text(voice.note).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 3).padding(.horizontal, 6)
+                .background(Color.primary.opacity(hovering ? 0.06 : 0), in: RoundedRectangle(cornerRadius: 7))
+                .contentShape(Rectangle())
             }
-            Spacer()
-            if selected { Image(systemName: "checkmark").font(.footnote.weight(.semibold)).foregroundStyle(Color.accentColor) }
-            Button(action: sample) {
+            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+            .onHover { hovering = $0 }
+            .help("Choose a voice")
+
+            Button { model.sampleVoice(voice.id) } label: {
                 ZStack {
-                    Circle().fill(isPlaying ? Color.accentColor : Color.primary.opacity(hovering ? 0.1 : 0.06))
                     if isLoading {
                         ProgressView().controlSize(.mini)
                     } else {
                         Image(systemName: isPlaying ? "stop.fill" : "play.fill")
-                            .font(.system(size: 9.5)).foregroundStyle(isPlaying ? .white : .secondary)
+                            .font(.system(size: 10, weight: .semibold)).foregroundStyle(isPlaying ? .white : .secondary)
                     }
                 }
-                .frame(width: 26, height: 26)
+                .frame(width: 30, height: 30)
+                .glassCircle(tint: isPlaying ? .accentColor : nil)
+                .contentShape(Circle())
             }
-            .buttonStyle(.plain).help("Play a sample")
+            .buttonStyle(.plain).help(isPlaying ? "Stop" : "Hear a sample")
         }
-        .contentShape(Rectangle())
-        .onTapGesture(perform: select)
-        .onHover { hovering = $0 }
-        .listRowBackground(selected ? Color.accentColor.opacity(0.16) : nil)
+        .onChange(of: model.voiceID) { _, _ in model.samplePlayer.stop() }
+    }
+}
+
+struct VoiceAvatar: View {
+    let voice: Voice
+
+    var body: some View {
+        ZStack {
+            Circle().fill(gradient)
+            Text(String(voice.name.prefix(1))).font(.system(size: 14, weight: .semibold, design: .rounded)).foregroundStyle(.white)
+        }
+        .frame(width: 30, height: 30)
     }
 
-    private var avatarGradient: LinearGradient {
+    private var gradient: LinearGradient {
         let colors: [Color] = voice.gender == "F"
             ? [Color(red: 0.96, green: 0.62, blue: 0.40), Color(red: 0.90, green: 0.40, blue: 0.45)]
             : [Color(red: 0.36, green: 0.58, blue: 0.95), Color(red: 0.30, green: 0.40, blue: 0.85)]
         return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+}
+
+struct GradeBadge: View {
+    let grade: String
+
+    var body: some View {
+        let good = grade.hasPrefix("A")
+        Text(grade).font(.system(size: 9.5, weight: .medium))
+            .padding(.horizontal, 4).padding(.vertical, 1)
+            .background(good ? Color.green.opacity(0.18) : Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 3))
+            .foregroundStyle(good ? Color.green : Color.secondary)
     }
 }
 
@@ -301,8 +352,9 @@ struct StatusPill: View {
             if isBusy { ProgressView().controlSize(.mini) } else { Circle().fill(color).frame(width: 7, height: 7) }
             Text(text).font(.callout).foregroundStyle(.secondary).monospacedDigit()
         }
-        .padding(.horizontal, 10).padding(.vertical, 4)
-        .background(.quaternary.opacity(0.6), in: Capsule())
+        .fixedSize()
+        .padding(.horizontal, 6).padding(.vertical, 2)
+        .modifier(PillBackground())
     }
 
     private var isBusy: Bool { if case .ready = status { return false }; if case .failed = status { return false }; return true }
@@ -318,6 +370,18 @@ struct StatusPill: View {
     }
 }
 
+/// macOS 26 draws every toolbar item on its own glass capsule, so a second capsule underneath just
+/// peeked out around the text; only older systems need us to draw the bubble.
+private struct PillBackground: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *) {
+            content
+        } else {
+            content.padding(.horizontal, 4).padding(.vertical, 2).background(.quaternary.opacity(0.6), in: Capsule())
+        }
+    }
+}
+
 struct ToastView: View {
     let toast: (text: String, isError: Bool)?
 
@@ -329,9 +393,7 @@ struct ToastView: View {
                 Text(toast.text).font(.callout).lineLimit(3)
             }
             .padding(.horizontal, 14).padding(.vertical, 9)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.1)))
-            .shadow(color: .black.opacity(0.15), radius: 10, y: 4)
+            .glassPanel(cornerRadius: 12)
             .padding(.horizontal, 20)
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .id(toast.text)

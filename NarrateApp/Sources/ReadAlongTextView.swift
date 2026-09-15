@@ -11,6 +11,7 @@ struct ReadAlongTextView: NSViewRepresentable {
     let timeline: Timeline
     let timelineVersion: Int
     let currentTime: Double
+    let bottomInset: CGFloat          // space under the text for the floating player bar
     let onWordTap: (Double) -> Void
     let onPlayerKey: (ReaderTextView.PlayerKey) -> Void
 
@@ -44,6 +45,9 @@ struct ReadAlongTextView: NSViewRepresentable {
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
         scroll.autohidesScrollers = true
+        scroll.automaticallyAdjustsContentInsets = false
+        scroll.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: bottomInset, right: 0)
+        scroll.scrollerInsets = NSEdgeInsets(top: 0, left: 0, bottom: bottomInset, right: 0)
         scroll.onUserScroll = { [weak coord = context.coordinator] in coord?.userScrolled() }
 
         let c = context.coordinator

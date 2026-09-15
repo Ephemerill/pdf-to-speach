@@ -65,13 +65,19 @@ and staples the tickets — the DMG then opens on any Mac with no warnings.
    site's bot check if asked (logins stick between runs). Once the article is on screen, hit
    **Capture Page Text**. It tries, in order: page-scan images → OCR (JSTOR's viewer), the article's
    text, then scroll-and-screenshot → OCR. Running headers, page numbers and footnotes are stripped.
-4. Pick a voice (▶ plays a sample at the chosen speed), set speed and format, **Generate Audiobook** (⌘↩).
+4. Pick a voice from the menu (▶ plays a sample instantly — previews are rendered once in the
+   background and cached). Speed and format live under *Options* (1× MP3 by default; your choices
+   are remembered). **Generate Audiobook** (⌘↩).
 5. The reader opens as soon as the first chunk is synthesized and plays while the rest generates in
    the background. Skip anywhere — the engine synthesizes that part next, then fills in the gaps.
    The finished file (and its sidecar) is written once everything is done.
 6. Click any word to jump there; `space` play/pause, `←`/`→` skip 10 s, `↑`/`↓` paragraphs; playback
    speed 0.75–3×. The text follows the narration; scroll and it steps aside until the spoken word
-   comes back into view. *Show in Finder* reveals the audio file.
+   comes back into view.
+7. To carry on listening on your phone: **AirDrop** in the toolbar (⇧⌘D) sends the MP3 straight to
+   your iPhone or iPad, **Share** offers Messages/Mail/Notes etc., and **Export ▸ Save a Copy…**
+   (⇧⌘E) drops a copy anywhere — e.g. iCloud Drive for the Files app. *Show in Finder* reveals the
+   original.
 
 ## Layout
 
@@ -89,6 +95,7 @@ NarrateApp/Sources/
   ModelDownloader.swift         one-time model download with progress
   Player.swift                  AVAudioPlayer wrappers
   Models.swift                  voices, documents, narration + sidecar format
+  Glass.swift                   Liquid Glass (macOS 26) / material (macOS 15) styling helpers
 NarrateApp/Resources/           Info.plist, icon generator
 engine/narrate_engine.py        the Python side: stdin/stdout JSON server (streams chunks, honours skip-ahead)
 engine/narrate/tts.py           Kokoro engine, chunking, word timings, encoding

@@ -19,7 +19,11 @@ struct NarrateApp: App {
                 Button("Open PDF…") { model.chooseFile() }.keyboardShortcut("o")
                 Button("New Document") { model.closeReader() }.keyboardShortcut("n").disabled(!model.showReader)
             }
-            CommandGroup(after: .toolbar) {
+            CommandGroup(after: .saveItem) {
+                Button("AirDrop Audio to Phone…") { model.airDrop() }.keyboardShortcut("d", modifiers: [.command, .shift])
+                    .disabled(model.narration == nil)
+                Button("Export Audio Copy…") { model.exportCopy() }.keyboardShortcut("e", modifiers: [.command, .shift])
+                    .disabled(model.narration == nil)
                 Button("Show Audio in Finder") { model.revealInFinder() }.keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(model.narration == nil)
             }

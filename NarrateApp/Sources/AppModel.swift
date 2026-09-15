@@ -47,10 +47,16 @@ final class AppModel {
     var pageFrom = ""
     var pageTo = ""
 
-    // Options
-    var voiceID = "af_heart"
-    var speed = 1.0
-    var format = "mp3"
+    // Options (remembered between launches)
+    var voiceID = UserDefaults.standard.string(forKey: "voice") ?? "af_heart" {
+        didSet { UserDefaults.standard.set(voiceID, forKey: "voice") }
+    }
+    var speed = UserDefaults.standard.object(forKey: "speed") as? Double ?? 1.0 {
+        didSet { UserDefaults.standard.set(speed, forKey: "speed") }
+    }
+    var format = UserDefaults.standard.string(forKey: "format") ?? "mp3" {
+        didSet { UserDefaults.standard.set(format, forKey: "format") }
+    }
 
     // Work in flight
     var isGenerating = false
@@ -72,7 +78,12 @@ final class AppModel {
     let player = Player()
     let samplePlayer = SamplePlayer()
     let browser = BrowserController()
-    private var sampleCache: [String: URL] = [:]
+    /// Voice previews live on disk (Application Support/Narrate/samples/<key>/), rendered once per voice
+    /// in the background right after the engine comes up, so pressing play is instant from then on.
+    private var sampleKey = "default"
+    private var sampleJobs: [String: Task<URL, Error>] = [:]
+    private var prewarmTask: Task<Void, Never>?
+    private(set) var cachedSampleIDs: Set<String> = []
     private var toastTask: Task<Void, Never>?
     private var started = false
     private var pendingOpen: [URL] = []
@@ -129,11 +140,13 @@ final class AppModel {
             log.info("bootstrap: hello ok, ffmpeg=\(hello["ffmpeg"] as? Bool ?? false)")
             ffmpegAvailable = hello["ffmpeg"] as? Bool ?? false
             if !formats.contains(format) { format = "mp3" }
+            if let key = hello["sample_key"] as? String { sampleKey = key }
             _ = try await engine.call("warm_up")
             log.info("bootstrap: engine ready")
             status = .ready
             let queued = pendingOpen; pendingOpen = []
             if !queued.isEmpty { open(queued) }
+            prewarmSamples()
         } catch {
             log.error("bootstrap failed: \(error.localizedDescription, privacy: .public)")
             status = .failed(error.localizedDescription)
@@ -141,6 +154,8 @@ final class AppModel {
     }
 
     func retrySetup() {
+        prewarmTask?.cancel(); prewarmTask = nil
+        sampleJobs.removeAll()
         engine.stop()
         status = .starting
         started = false
@@ -259,24 +274,68 @@ final class AppModel {
 
     // MARK: - Voices
 
+    private var sampleDir: URL { Self.supportDir.appendingPathComponent("samples/\(sampleKey)") }
+    private func sampleFile(_ id: String) -> URL { sampleDir.appendingPathComponent("\(id).wav") }
+
+    /// Preview a voice at the current speed. Instant when the sample is cached; otherwise it's rendered
+    /// now (and kept), jumping the queue ahead of the background pre-render.
     func sampleVoice(_ id: String) {
-        guard status.isReady else { showToast("The voice model is still loading.", isError: true); return }
         if samplePlayer.playingID == id { samplePlayer.stop(); return }
-        let key = "\(id)@\(String(format: "%.2f", speed))"
+        guard status.isReady else { showToast("The voice model is still loading.", isError: true); return }
         Task {
             do {
-                if sampleCache[key] == nil {
-                    loadingSampleID = id
-                    defer { loadingSampleID = nil }
-                    let out = FileManager.default.temporaryDirectory.appendingPathComponent("narrate-sample-\(key).wav")
-                    _ = try await engine.call("sample", ["voice": id, "speed": speed, "out": out.path])
-                    sampleCache[key] = out
-                }
-                try samplePlayer.play(url: sampleCache[key]!, id: id)
+                if !cachedSampleIDs.contains(id) { loadingSampleID = id }
+                defer { if loadingSampleID == id { loadingSampleID = nil } }
+                let url = try await ensureSample(id)
+                try samplePlayer.play(url: url, id: id, rate: speed)
+            } catch is CancellationError {
             } catch {
                 showToast("Sample failed: \(error.localizedDescription)", isError: true)
             }
         }
+    }
+
+    /// Render every voice's sample that isn't on disk yet, selected voice first, one at a time and only
+    /// while nothing else needs the engine. Also drops caches left by older sample scripts.
+    private func prewarmSamples() {
+        prewarmTask?.cancel()
+        let fm = FileManager.default
+        try? fm.createDirectory(at: sampleDir, withIntermediateDirectories: true)
+        if let dirs = try? fm.contentsOfDirectory(at: sampleDir.deletingLastPathComponent(), includingPropertiesForKeys: nil) {
+            for d in dirs where d.lastPathComponent != sampleKey { try? fm.removeItem(at: d) }
+        }
+        cachedSampleIDs = Set(Voice.all.map(\.id).filter { fm.fileExists(atPath: sampleFile($0).path) })
+        let order = [voiceID] + Voice.all.map(\.id).filter { $0 != voiceID }
+        prewarmTask = Task {
+            for id in order where !cachedSampleIDs.contains(id) {
+                while isGenerating || isCapturing {                 // don't compete with real work
+                    try? await Task.sleep(for: .seconds(1))
+                    if Task.isCancelled { return }
+                }
+                if Task.isCancelled || !status.isReady { return }
+                _ = try? await ensureSample(id)
+            }
+            log.info("samples: all \(self.cachedSampleIDs.count) voice previews cached")
+        }
+    }
+
+    /// The on-disk sample for a voice, rendering it if needed. Concurrent callers share one render.
+    private func ensureSample(_ id: String) async throws -> URL {
+        let file = sampleFile(id)
+        if FileManager.default.fileExists(atPath: file.path) { cachedSampleIDs.insert(id); return file }
+        if let job = sampleJobs[id] { return try await job.value }
+        let job = Task<URL, Error> {
+            defer { sampleJobs[id] = nil }
+            // Write to a temp name and rename, so a half-written file is never mistaken for a sample.
+            let tmp = file.appendingPathExtension("part")
+            _ = try await engine.call("sample", ["voice": id, "speed": 1.0, "out": tmp.path])
+            try? FileManager.default.removeItem(at: file)
+            try FileManager.default.moveItem(at: tmp, to: file)
+            cachedSampleIDs.insert(id)
+            return file
+        }
+        sampleJobs[id] = job
+        return try await job.value
     }
 
     // MARK: - Generation
@@ -331,6 +390,7 @@ final class AppModel {
                 try? n.writeSidecar()
                 narration = n
                 if !showReader { try openReader(Timeline(narration: n)) }
+                showToast("Saved \(n.name) — AirDrop it to your phone from the toolbar.", isError: false)
             } catch let e as Engine.Failure where e.cancelled {
                 showToast("Cancelled", isError: false)
             } catch {
@@ -416,6 +476,36 @@ final class AppModel {
     func revealInFinder() {
         guard let n = narration else { return }
         NSWorkspace.shared.activateFileViewerSelecting([n.url])
+    }
+
+    // MARK: - Getting the audio onto other devices
+
+    /// Send the finished audio file straight to a nearby iPhone/iPad/Mac.
+    func airDrop() {
+        guard let n = narration else { return }
+        guard let service = NSSharingService(named: .sendViaAirDrop), service.canPerform(withItems: [n.url]) else {
+            showToast("AirDrop isn't available — check that Wi-Fi and Bluetooth are on.", isError: true); return
+        }
+        service.perform(withItems: [n.url])
+    }
+
+    /// Save a copy of the audio file somewhere else (iCloud Drive is the other easy route to a phone).
+    func exportCopy() {
+        guard let n = narration else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Audiobook"
+        panel.message = "Choose where to save a copy of the audio. Save it in iCloud Drive to open it from the Files app on your phone."
+        panel.nameFieldStringValue = n.name
+        panel.canCreateDirectories = true
+        if let type = UTType(filenameExtension: n.url.pathExtension) { panel.allowedContentTypes = [type] }
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+        do {
+            if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
+            try FileManager.default.copyItem(at: n.url, to: dest)
+            showToast("Saved a copy to \(dest.deletingLastPathComponent().lastPathComponent).", isError: false)
+        } catch {
+            showToast("Couldn't save the copy: \(error.localizedDescription)", isError: true)
+        }
     }
 
     // MARK: - Toast

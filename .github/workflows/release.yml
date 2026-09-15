@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15          # Apple Silicon runner with Xcode preinstalled
+    runs-on: macos-26          # Apple Silicon runner with Xcode 26 (needed for the Liquid Glass APIs)
     steps:
       - uses: actions/checkout@v4
 

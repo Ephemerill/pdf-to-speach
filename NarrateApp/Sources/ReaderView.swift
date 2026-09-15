@@ -5,13 +5,11 @@ struct ReaderView: View {
     let timeline: Timeline
 
     var body: some View {
-        VStack(spacing: 0) {
-            ReadAlongTextView(timeline: timeline, timelineVersion: timeline.version, currentTime: model.player.currentTime,
-                              onWordTap: { t in model.player.seek(to: t); if !model.player.isPlaying { model.player.play() } },
-                              onPlayerKey: handle)
-            Divider()
-            PlayerBar(timeline: timeline)
-        }
+        ReadAlongTextView(timeline: timeline, timelineVersion: timeline.version, currentTime: model.player.currentTime,
+                          bottomInset: PlayerBar.height + 24,
+                          onWordTap: { t in model.player.seek(to: t); if !model.player.isPlaying { model.player.play() } },
+                          onPlayerKey: handle)
+        .overlay(alignment: .bottom) { PlayerBar(timeline: timeline) }
         .background(.background)
         .navigationTitle(timeline.title)
         .navigationSubtitle(subtitle)
@@ -20,13 +18,32 @@ struct ReaderView: View {
                 Button { model.closeReader() } label: { Label("New Document", systemImage: "chevron.left") }
                     .help(model.isGenerating ? "Stop and go back" : "Back to start")
             }
-            ToolbarItem(placement: .primaryAction) {
-                Button { model.revealInFinder() } label: { Label("Show in Finder", systemImage: "folder") }
-                    .help(model.narration == nil ? "Available once the audiobook is finished" : "Show the audio file in Finder")
-                    .disabled(model.narration == nil)
+            ToolbarItemGroup(placement: .primaryAction) {
+                let done = model.narration != nil
+                let waiting = "Available once the audiobook is finished"
+                Button { model.airDrop() } label: { Label("AirDrop", systemImage: "iphone.and.arrow.forward") }
+                    .labelStyle(.titleAndIcon)
+                    .help(done ? "Send the audio to your iPhone or iPad with AirDrop" : waiting)
+                    .disabled(!done)
+                if let n = model.narration {
+                    ShareLink(item: n.url, preview: SharePreview(n.title, image: Image(systemName: "waveform"))) {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                    }
+                    .help("Share the audio — Messages, Mail, Notes, AirDrop…")
+                } else {
+                    Button {} label: { Label("Share", systemImage: "square.and.arrow.up") }.help(waiting).disabled(true)
+                }
+                Menu {
+                    Button("Save a Copy…") { model.exportCopy() }
+                    Button("Show in Finder") { model.revealInFinder() }
+                } label: {
+                    Label("Export", systemImage: "arrow.down.document")
+                }
+                .help(done ? "Export the audio file" : waiting)
+                .disabled(!done)
             }
         }
-        .overlay(alignment: .bottom) { ToastView(toast: model.toast).padding(.bottom, 110) }
+        .overlay(alignment: .bottom) { ToastView(toast: model.toast).padding(.bottom, PlayerBar.height + 28) }
     }
 
     private var subtitle: String {
@@ -47,10 +64,12 @@ struct ReaderView: View {
     }
 }
 
+/// Transport controls floating on glass over the text.
 struct PlayerBar: View {
     @Environment(AppModel.self) private var model
     let timeline: Timeline
     @State private var scrub: Double? = nil
+    static let height: CGFloat = 96
 
     private var player: Player { model.player }
 
@@ -72,7 +91,6 @@ struct PlayerBar: View {
                         .keyboardShortcut(.leftArrow, modifiers: [])
                     Button { player.toggle() } label: {
                         ZStack {
-                            Circle().fill(Color.accentColor)
                             if player.isWaiting {
                                 ProgressView().controlSize(.small).tint(.white)
                             } else {
@@ -82,6 +100,7 @@ struct PlayerBar: View {
                             }
                         }
                         .frame(width: 44, height: 44)
+                        .glassCircle(tint: .accentColor)
                         .contentShape(Circle())
                     }
                     .buttonStyle(.plain).help(player.isWaiting ? "Waiting for this part to be generated…" : player.isPlaying ? "Pause (space)" : "Play (space)")
@@ -132,8 +151,11 @@ struct PlayerBar: View {
             }
             .frame(maxWidth: 240, alignment: .trailing)
         }
-        .padding(.horizontal, 20).padding(.vertical, 12)
-        .background(.bar)
+        .padding(.horizontal, 20)
+        .frame(height: Self.height)
+        .frame(maxWidth: 1000)
+        .glassPanel(cornerRadius: 24)
+        .padding(.horizontal, 16).padding(.bottom, 16)
     }
 
     private func rateLabel(_ r: Float) -> String { (r == r.rounded() ? String(Int(r)) : String(format: "%.2g", r)) + "×" }
