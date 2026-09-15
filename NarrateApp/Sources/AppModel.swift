@@ -1,0 +1,431 @@
+import AppKit
+import Foundation
+import Observation
+import os
+import UniformTypeIdentifiers
+
+let log = Logger(subsystem: "com.narrate.app", category: "app")
+
+/// All app state. The views render it; it drives the engine, the downloader, the browser and the player.
+@Observable @MainActor
+final class AppModel {
+    static let shared = AppModel()
+
+    enum Source: String, CaseIterable, Identifiable {
+        case pdf = "PDF", text = "Text", link = "Link"
+        var id: String { rawValue }
+    }
+
+    enum Status: Equatable {
+        case starting
+        case downloading(String, Double)
+        case loading
+        case ready
+        case failed(String)
+
+        var isReady: Bool { self == .ready }
+    }
+
+    struct GenerationProgress: Equatable {
+        var label: String? = nil
+        var done = 0, total = 0
+        var seconds = 0.0
+        var eta: Double? = nil
+        var fraction: Double { total > 0 ? Double(done) / Double(total) : 0 }
+    }
+
+    // Engine / setup
+    var status: Status = .starting
+    var ffmpegAvailable = false
+    var formats: [String] { ffmpegAvailable ? ["mp3", "m4a", "wav"] : ["mp3", "wav"] }
+
+    // Input
+    var source: Source = .pdf
+    var document: SourceDocument?
+    var pastedText = ""
+    var linkText = ""
+    var pageFrom = ""
+    var pageTo = ""
+
+    // Options
+    var voiceID = "af_heart"
+    var speed = 1.0
+    var format = "mp3"
+
+    // Work in flight
+    var isGenerating = false
+    var progress = GenerationProgress()
+    var isCapturing = false
+    var captureLabel = "Capturing…"
+    var loadingSampleID: String?
+
+    // Output
+    var timeline: Timeline?          // what the reader shows (streams in during generation)
+    var narration: Narration?        // the finished, encoded file (nil until generation completes)
+    var showReader = false
+    private var chunkDir: URL?
+
+    // Feedback
+    var toast: (text: String, isError: Bool)?
+
+    let engine = Engine()
+    let player = Player()
+    let samplePlayer = SamplePlayer()
+    let browser = BrowserController()
+    private var sampleCache: [String: URL] = [:]
+    private var toastTask: Task<Void, Never>?
+    private var started = false
+    private var pendingOpen: [URL] = []
+
+    // MARK: - Locations
+
+    static let supportDir: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Narrate")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+    static let modelDir = supportDir.appendingPathComponent("models")
+
+    /// The embedded Python runtime and engine script (overridable for development runs outside the bundle).
+    static var pythonURL: URL {
+        if let p = ProcessInfo.processInfo.environment["NARRATE_PYTHON"] { return URL(fileURLWithPath: p) }
+        return Bundle.main.resourceURL!.appendingPathComponent("python/bin/python3")
+    }
+    static var engineScriptURL: URL {
+        if let p = ProcessInfo.processInfo.environment["NARRATE_ENGINE"] { return URL(fileURLWithPath: p) }
+        return Bundle.main.resourceURL!.appendingPathComponent("engine/narrate_engine.py")
+    }
+
+    // MARK: - Startup
+
+    func start() {
+        guard !started else { return }
+        started = true
+        Task { await bootstrap() }
+    }
+
+    private func bootstrap() async {
+        log.info("bootstrap: python=\(Self.pythonURL.path, privacy: .public) engine=\(Self.engineScriptURL.path, privacy: .public)")
+        do {
+            if !ModelDownloader.isReady(in: Self.modelDir) {
+                log.info("bootstrap: downloading model")
+                status = .downloading("Downloading voice model…", 0)
+                try await ModelDownloader().download(to: Self.modelDir) { label, frac in
+                    Task { @MainActor in self.status = .downloading(label, frac) }
+                }
+            }
+            status = .loading
+            engine.onExit = { [weak self] code in
+                Task { @MainActor in
+                    guard let self else { return }
+                    if self.status == .ready || self.status == .loading {
+                        self.status = .failed("The narration engine stopped (exit \(code)). See engine.log in Application Support.")
+                    }
+                }
+            }
+            try engine.start(python: Self.pythonURL, script: Self.engineScriptURL, modelDir: Self.modelDir,
+                             log: Self.supportDir.appendingPathComponent("engine.log"))
+            let hello = try await engine.call("hello")
+            log.info("bootstrap: hello ok, ffmpeg=\(hello["ffmpeg"] as? Bool ?? false)")
+            ffmpegAvailable = hello["ffmpeg"] as? Bool ?? false
+            if !formats.contains(format) { format = "mp3" }
+            _ = try await engine.call("warm_up")
+            log.info("bootstrap: engine ready")
+            status = .ready
+            let queued = pendingOpen; pendingOpen = []
+            if !queued.isEmpty { open(queued) }
+        } catch {
+            log.error("bootstrap failed: \(error.localizedDescription, privacy: .public)")
+            status = .failed(error.localizedDescription)
+        }
+    }
+
+    func retrySetup() {
+        engine.stop()
+        status = .starting
+        started = false
+        start()
+    }
+
+    // MARK: - Opening things
+
+    func open(_ urls: [URL]) {
+        log.info("open: \(urls.map(\.lastPathComponent).joined(separator: ", "), privacy: .public) status=\(String(describing: self.status), privacy: .public)")
+        // Files opened from Finder before the engine is up (e.g. double-clicking a PDF at launch): wait for it.
+        if !status.isReady, urls.contains(where: { $0.pathExtension.lowercased() == "pdf" }) {
+            pendingOpen = urls
+            return
+        }
+        for url in urls {
+            let ext = url.pathExtension.lowercased()
+            if ext == "pdf" { openPDF(url); return }
+            if url.lastPathComponent.lowercased().hasSuffix(".narrate.json") { reopen(sidecar: url); return }
+            if ["mp3", "m4a", "wav"].contains(ext) {
+                let sidecar = url.deletingPathExtension().appendingPathExtension("narrate.json")
+                if FileManager.default.fileExists(atPath: sidecar.path) { reopen(sidecar: sidecar); return }
+            }
+        }
+        showToast("Drop a PDF (or an audiobook Narrate made earlier).", isError: true)
+    }
+
+    func chooseFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.pdf, .mp3, .wav, UTType(filenameExtension: "m4a") ?? .audio, .json]
+        panel.message = "Choose a PDF, or an audiobook Narrate made earlier"
+        if panel.runModal() == .OK, let url = panel.url { open([url]) }
+    }
+
+    func openPDF(_ url: URL, first: Int? = nil, last: Int? = nil) {
+        Task {
+            do {
+                var args: Engine.JSON = ["path": url.path]
+                if let first { args["first"] = first }
+                if let last { args["last"] = last }
+                let r = try await engine.call("extract", args)
+                let paras = r["paragraphs"] as? [String] ?? []
+                guard !paras.isEmpty else {
+                    showToast("No readable text found. This PDF looks like scanned images.", isError: true); return
+                }
+                let keepRange = first != nil || last != nil
+                setDocument(SourceDocument(name: r["name"] as? String ?? url.lastPathComponent, path: url.path,
+                                           pages: r["pages"] as? Int ?? 0, paragraphs: paras, method: nil), keepPages: keepRange)
+                source = .pdf
+            } catch {
+                showToast("Couldn't read that PDF: \(error.localizedDescription)", isError: true)
+            }
+        }
+    }
+
+    func useText() {
+        let paras = pastedText.components(separatedBy: #"\n\s*\n"#, regex: true)
+            .map { $0.replacing(regex: #"\s+"#, with: " ").trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard !paras.isEmpty else { showToast("Paste some text first.", isError: true); return }
+        let title = paras[0].count > 60 ? String(paras[0].prefix(60)) + "…" : paras[0]
+        setDocument(SourceDocument(name: title, path: nil, pages: 0, paragraphs: paras, method: nil))
+    }
+
+    func applyPageRange() {
+        guard let doc = document, let path = doc.path else { return }
+        openPDF(URL(fileURLWithPath: path), first: Int(pageFrom.trimmingCharacters(in: .whitespaces)),
+                last: Int(pageTo.trimmingCharacters(in: .whitespaces)))
+    }
+
+    private func setDocument(_ doc: SourceDocument, keepPages: Bool = false) {
+        document = doc
+        if !keepPages { pageFrom = ""; pageTo = "" }
+    }
+
+    func clearDocument() { document = nil }
+
+    func reopen(sidecar: URL) {
+        do {
+            let n = try Narration.load(sidecar: sidecar)
+            narration = n
+            try openReader(Timeline(narration: n))
+        } catch {
+            showToast("Couldn't reopen narration: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    // MARK: - Built-in browser
+
+    func openLink(openWindow: (String) -> Void) {
+        guard !linkText.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        openWindow("browser")
+        browser.load(linkText)
+    }
+
+    func capturePage() {
+        guard browser.isOpen, !isCapturing else { return }
+        isCapturing = true
+        captureLabel = "Capturing…"
+        Task {
+            defer { isCapturing = false }
+            do {
+                let r = try await Capture.run(browser.webView) { label, _ in
+                    Task { @MainActor in self.captureLabel = label }
+                }
+                guard !r.paragraphs.isEmpty else { showToast("Couldn't find readable text on that page.", isError: true); return }
+                setDocument(SourceDocument(name: r.title, path: nil, pages: 0, paragraphs: r.paragraphs, method: r.method))
+                source = .link
+                showToast("Captured \(r.paragraphs.count) paragraphs via \(r.method).", isError: false)
+                NSApp.activate(ignoringOtherApps: true)
+            } catch {
+                showToast("Capture failed: \(error.localizedDescription)", isError: true)
+            }
+        }
+    }
+
+    // MARK: - Voices
+
+    func sampleVoice(_ id: String) {
+        guard status.isReady else { showToast("The voice model is still loading.", isError: true); return }
+        if samplePlayer.playingID == id { samplePlayer.stop(); return }
+        let key = "\(id)@\(String(format: "%.2f", speed))"
+        Task {
+            do {
+                if sampleCache[key] == nil {
+                    loadingSampleID = id
+                    defer { loadingSampleID = nil }
+                    let out = FileManager.default.temporaryDirectory.appendingPathComponent("narrate-sample-\(key).wav")
+                    _ = try await engine.call("sample", ["voice": id, "speed": speed, "out": out.path])
+                    sampleCache[key] = out
+                }
+                try samplePlayer.play(url: sampleCache[key]!, id: id)
+            } catch {
+                showToast("Sample failed: \(error.localizedDescription)", isError: true)
+            }
+        }
+    }
+
+    // MARK: - Generation
+
+    var canGenerate: Bool { status.isReady && document != nil && !isGenerating }
+
+    func generate() {
+        guard canGenerate, let doc = document else { return }
+        isGenerating = true
+        progress = GenerationProgress(label: "Warming up…")
+        let voice = Voice.named(voiceID)
+        let folder = doc.path.map { ($0 as NSString).deletingLastPathComponent }
+            ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0].path
+        var stem = (doc.isPDF ? (doc.name as NSString).deletingPathExtension : doc.name)
+            .replacing(regex: #"[\\/:*?"<>|]+"#, with: " ").trimmingCharacters(in: .whitespaces)
+        stem = String(stem.prefix(80))
+        if stem.isEmpty { stem = "Narration" }
+        let title = doc.isPDF ? (doc.name as NSString).deletingPathExtension : doc.name
+        let outBase = (folder as NSString).appendingPathComponent("\(stem) – \(voice.name)")
+        // Same whitespace normalisation as the engine, so word counts line up chunk for chunk.
+        let paragraphs = doc.paragraphs
+            .map { $0.replacing(regex: #"\s+"#, with: " ").trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("narrate-\(UUID().uuidString)")
+        cleanupChunks()
+        chunkDir = dir
+        let t0 = Date()
+        let speed = self.speed
+
+        Task {
+            defer {
+                isGenerating = false
+                if !showReader { cleanupChunks() }     // reader was closed mid-way; the engine has stopped now
+            }
+            do {
+                let r = try await engine.call("narrate", [
+                    "paragraphs": paragraphs, "voice": voice.id, "speed": speed, "fmt": format,
+                    "out_base": outBase, "chunk_dir": dir.path,
+                ]) { p in
+                    Task { @MainActor in self.handleGenerationEvent(p, title: title, voice: voice.name,
+                                                                     paragraphs: paragraphs, speed: speed, startedAt: t0) }
+                }
+                let words = (r["paragraphs"] as? [[[Any]]] ?? []).map { p in
+                    p.compactMap { w -> TimedWord? in
+                        guard w.count == 3, let t = w[0] as? String, let s = w[1] as? Double, let e = w[2] as? Double else { return nil }
+                        return TimedWord(text: t, start: s, end: e)
+                    }
+                }
+                let path = r["path"] as? String ?? outBase
+                let n = Narration(path: path, name: (path as NSString).lastPathComponent, title: title,
+                                  voice: voice.name, duration: r["duration"] as? Double ?? 0, paragraphs: words)
+                try? n.writeSidecar()
+                narration = n
+                if !showReader { try openReader(Timeline(narration: n)) }
+            } catch let e as Engine.Failure where e.cancelled {
+                showToast("Cancelled", isError: false)
+            } catch {
+                showToast("Generation failed: \(error.localizedDescription)", isError: true)
+            }
+        }
+    }
+
+    private func handleGenerationEvent(_ p: Engine.JSON, title: String, voice: String, paragraphs: [String],
+                                       speed: Double, startedAt: Date) {
+        switch p["event"] as? String {
+        case "plan":
+            let chunks = (p["chunks"] as? [[String: Any]] ?? []).map {
+                Timeline.Chunk(index: $0["index"] as? Int ?? 0, paragraph: $0["paragraph"] as? Int ?? 0,
+                               wordOffset: $0["word_offset"] as? Int ?? 0, wordCount: $0["words"] as? Int ?? 0)
+            }
+            let t = Timeline(title: title, voice: voice, paragraphs: paragraphs.map { $0.components(separatedBy: " ") },
+                             chunks: chunks, speed: speed)
+            progress = GenerationProgress(label: nil, done: 0, total: chunks.count)
+            try? openReader(t)
+        case "chunk":
+            guard let t = timeline, let index = p["index"] as? Int, let path = p["path"] as? String else { return }
+            let words = (p["words"] as? [[Double]] ?? []).compactMap { $0.count == 2 ? (start: $0[0], end: $0[1]) : nil }
+            t.receive(index: index, url: URL(fileURLWithPath: path), duration: p["duration"] as? Double ?? 0, words: words)
+            player.chunkArrived(index)
+        default:
+            if let label = p["label"] as? String { progress.label = label; return }
+            let done = p["done"] as? Int ?? 0, total = p["total"] as? Int ?? 0
+            let elapsed = Date().timeIntervalSince(startedAt)
+            progress = GenerationProgress(label: nil, done: done, total: total, seconds: timeline?.duration ?? 0,
+                                          eta: done > 0 ? elapsed / Double(done) * Double(total - done) : nil)
+        }
+    }
+
+    func cleanupChunks() {
+        if let d = chunkDir { try? FileManager.default.removeItem(at: d) }
+        chunkDir = nil
+    }
+
+    func cancelGeneration() { engine.cancelCurrent() }
+
+    /// The listener skipped somewhere that isn't synthesized yet: make the engine go there next.
+    private func prioritize(chunk: Int) {
+        guard isGenerating else { return }
+        engine.send("prioritize", ["chunk": chunk])
+    }
+
+    // MARK: - Reader
+
+    private func openReader(_ t: Timeline) throws {
+        player.onNeedChunk = { [weak self] k in self?.prioritize(chunk: k) }
+        player.load(t)
+        timeline = t
+        showReader = true
+        player.play()
+    }
+
+    func jumpParagraph(_ delta: Int) {
+        guard let tl = timeline else { return }
+        let t = player.currentTime
+        // First word of each paragraph, on the (possibly estimated) timeline.
+        let flat = tl.wordStarts()
+        var starts: [Double] = []
+        var i = 0
+        for p in tl.paragraphs where !p.isEmpty { starts.append(flat[i]); i += p.count }
+        guard !starts.isEmpty else { return }
+        var cur = starts.lastIndex { $0 <= t } ?? 0
+        // Going back restarts the current paragraph first, like a track button.
+        if delta < 0, t - starts[cur] > 2 { cur += 1 }
+        let target = max(0, min(starts.count - 1, cur + delta))
+        player.seek(to: starts[target])
+    }
+
+    func closeReader() {
+        player.stop()
+        if isGenerating { engine.cancelCurrent() }
+        showReader = false
+        timeline = nil
+        narration = nil
+        if !isGenerating { cleanupChunks() }
+    }
+
+    func revealInFinder() {
+        guard let n = narration else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([n.url])
+    }
+
+    // MARK: - Toast
+
+    func showToast(_ text: String, isError: Bool) {
+        toast = (text, isError)
+        toastTask?.cancel()
+        toastTask = Task {
+            try? await Task.sleep(for: .seconds(4))
+            if !Task.isCancelled { toast = nil }
+        }
+    }
+}

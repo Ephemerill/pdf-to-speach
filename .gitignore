@@ -1,5 +1,7 @@
 .venv/
 models/
+build/
+dist/
 __pycache__/
 *.pyc
 samples/*.mp3

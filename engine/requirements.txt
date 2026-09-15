@@ -1,0 +1,5 @@
+kokoro-onnx>=0.6.1
+onnxruntime>=1.20
+pymupdf>=1.25
+soundfile>=0.13
+numpy>=2.0
