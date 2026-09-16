@@ -34,7 +34,7 @@ struct HomeView: View {
 
                 if let doc = model.document { DocumentCard(doc: doc) }
 
-                Section("Voice") { VoicePickerRow() }
+                Section("Voice") { VoiceRow() }
 
                 // 1× MP3 is what nearly everyone wants, so these stay folded away until needed.
                 Section {
@@ -259,89 +259,6 @@ struct DocumentCard: View {
         var s = (doc.isPDF ? "\(doc.pages) pages · " : "") + "\(doc.words.formatted()) words · about \(Format.time(mins * 60)) of audio"
         if let m = doc.method { s += " · via \(m)" }
         return s
-    }
-}
-
-/// The chosen voice with a preview button; every other voice is one menu away instead of a long list.
-struct VoicePickerRow: View {
-    @Environment(AppModel.self) private var model
-    @State private var hovering = false
-
-    var body: some View {
-        @Bindable var model = model
-        let voice = Voice.named(model.voiceID)
-        let isPlaying = model.samplePlayer.playingID == voice.id
-        let isLoading = model.loadingSampleID == voice.id
-        HStack(spacing: 12) {
-            Menu {
-                ForEach(["US", "UK"], id: \.self) { accent in
-                    Section(accent == "US" ? "American" : "British") {
-                        Picker("Voice", selection: $model.voiceID) {
-                            ForEach(Voice.all.filter { $0.accent == accent }) { v in
-                                Text("\(v.name)  ·  \(v.note)").tag(v.id)
-                            }
-                        }
-                        .pickerStyle(.inline).labelsHidden()
-                    }
-                }
-            } label: {
-                HStack(spacing: 12) {
-                    VoiceAvatar(voice: voice)
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text(voice.name).fontWeight(.semibold)
-                            Text(voice.accent == "US" ? "American" : "British").font(.caption2).foregroundStyle(.tertiary)
-                            GradeBadge(grade: voice.grade)
-                        }
-                        Text(voice.note).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Spacer(minLength: 4)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-                }
-                .padding(.vertical, 3).padding(.horizontal, 6)
-                .background(Color.primary.opacity(hovering ? 0.06 : 0), in: RoundedRectangle(cornerRadius: 7))
-                .contentShape(Rectangle())
-            }
-            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
-            .onHover { hovering = $0 }
-            .help("Choose a voice")
-
-            Button { model.sampleVoice(voice.id) } label: {
-                ZStack {
-                    if isLoading {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Image(systemName: isPlaying ? "stop.fill" : "play.fill")
-                            .font(.system(size: 10, weight: .semibold)).foregroundStyle(isPlaying ? .white : .secondary)
-                    }
-                }
-                .frame(width: 30, height: 30)
-                .glassCircle(tint: isPlaying ? .accentColor : nil)
-                .contentShape(Circle())
-            }
-            .buttonStyle(.plain).help(isPlaying ? "Stop" : "Hear a sample")
-        }
-        .onChange(of: model.voiceID) { _, _ in model.samplePlayer.stop() }
-    }
-}
-
-struct VoiceAvatar: View {
-    let voice: Voice
-
-    var body: some View {
-        ZStack {
-            Circle().fill(gradient)
-            Text(String(voice.name.prefix(1))).font(.system(size: 14, weight: .semibold, design: .rounded)).foregroundStyle(.white)
-        }
-        .frame(width: 30, height: 30)
-    }
-
-    private var gradient: LinearGradient {
-        let colors: [Color] = voice.gender == "F"
-            ? [Color(red: 0.96, green: 0.62, blue: 0.40), Color(red: 0.90, green: 0.40, blue: 0.45)]
-            : [Color(red: 0.36, green: 0.58, blue: 0.95), Color(red: 0.30, green: 0.40, blue: 0.85)]
-        return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 }
 

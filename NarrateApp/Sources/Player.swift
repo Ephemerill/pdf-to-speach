@@ -201,7 +201,10 @@ final class Player {
 @Observable @MainActor
 final class SamplePlayer: NSObject, AVAudioPlayerDelegate {
     private(set) var playingID: String?
+    /// Loudness of what's playing, 0…1, so the voice orbs can move with the speech.
+    private(set) var level: Double = 0
     private var audio: AVAudioPlayer?
+    private var meter: Timer?
 
     /// Samples are rendered once at 1× and time-stretched here, so previews are instant at any speed.
     func play(url: URL, id: String, rate: Double = 1) throws {
@@ -210,17 +213,32 @@ final class SamplePlayer: NSObject, AVAudioPlayerDelegate {
         p.delegate = self
         p.enableRate = true
         p.rate = Float(min(2, max(0.5, rate)))
+        p.isMeteringEnabled = true
         p.play()
         audio = p
         playingID = id
+        meter?.invalidate()
+        meter = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.sample() }
+        }
+    }
+
+    private func sample() {
+        guard let a = audio, a.isPlaying else { level = 0; return }
+        a.updateMeters()
+        // -40 dB → 0, 0 dB → 1, with a little ease so quiet consonants still register.
+        let db = Double(a.averagePower(forChannel: 0))
+        level = pow(max(0, min(1, (db + 40) / 40)), 0.7)
     }
 
     func stop() {
         audio?.stop(); audio = nil
+        meter?.invalidate(); meter = nil
         playingID = nil
+        level = 0
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in self.playingID = nil }
+        Task { @MainActor in self.stop() }
     }
 }

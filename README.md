@@ -65,9 +65,10 @@ and staples the tickets — the DMG then opens on any Mac with no warnings.
    site's bot check if asked (logins stick between runs). Once the article is on screen, hit
    **Capture Page Text**. It tries, in order: page-scan images → OCR (JSTOR's viewer), the article's
    text, then scroll-and-screenshot → OCR. Running headers, page numbers and footnotes are stripped.
-4. Pick a voice from the menu (▶ plays a sample instantly — previews are rendered once in the
-   background and cached). Speed and format live under *Options* (1× MP3 by default; your choices
-   are remembered). **Generate Audiobook** (⌘↩).
+4. Pick a voice: click the voice row (or ⇧⌘V) for a grid of sixteen colour orbs, one per voice —
+   hover one to hear it, click to choose. Previews are instant because samples are rendered once in
+   the background and cached. Speed and format live under *Options* (1× MP3 by default; your
+   choices are remembered). **Generate Audiobook** (⌘↩).
 5. The reader opens as soon as the first chunk is synthesized and plays while the rest generates in
    the background. Skip anywhere — the engine synthesizes that part next, then fills in the gaps.
    The finished file (and its sidecar) is written once everything is done.
@@ -100,6 +101,7 @@ NarrateApp/Sources/
   Player.swift                  AVAudioPlayer wrappers
   Models.swift                  voices, documents, narration + sidecar format
   Glass.swift                   Liquid Glass (macOS 26) / material (macOS 15) styling helpers
+  VoiceOrb.swift                animated voice orbs, the voice row and the picker popover
   Updater.swift                 in-app updates from GitHub Releases (Narrate.zip)
 NarrateApp/Resources/           Info.plist, icon generator
 engine/narrate_engine.py        the Python side: stdin/stdout JSON server (streams chunks, honours skip-ahead)

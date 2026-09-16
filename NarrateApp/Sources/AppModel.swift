@@ -47,6 +47,8 @@ final class AppModel {
     var pageFrom = ""
     var pageTo = ""
 
+    var showVoicePicker = false
+
     // Options (remembered between launches)
     var voiceID = UserDefaults.standard.string(forKey: "voice") ?? "af_heart" {
         didSet { UserDefaults.standard.set(voiceID, forKey: "voice") }
@@ -241,6 +243,7 @@ final class AppModel {
             let n = try Narration.load(sidecar: sidecar)
             narration = n
             try openReader(Timeline(narration: n))
+            showToast("Reopened an audiobook Narrate made earlier. Drop a PDF to make a new one.", isError: false)
         } catch {
             showToast("Couldn't reopen narration: \(error.localizedDescription)", isError: true)
         }
@@ -295,6 +298,30 @@ final class AppModel {
             } catch {
                 showToast("Sample failed: \(error.localizedDescription)", isError: true)
             }
+        }
+    }
+
+    private var hoverTask: Task<Void, Never>?
+
+    /// Hovering an orb plays its sample after a beat (so sweeping across the grid doesn't fire them
+    /// all); leaving it stops. Pass nil to cancel everything.
+    func hoverPreview(_ id: String?, _ inside: Bool) {
+        hoverTask?.cancel(); hoverTask = nil
+        guard let id, inside else {
+            if id == nil || samplePlayer.playingID == id { samplePlayer.stop() }
+            return
+        }
+        if samplePlayer.playingID == id { return }
+        hoverTask = Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled, status.isReady else { return }
+            do {
+                if !cachedSampleIDs.contains(id) { loadingSampleID = id }
+                defer { if loadingSampleID == id { loadingSampleID = nil } }
+                let url = try await ensureSample(id)
+                guard !Task.isCancelled else { return }
+                try samplePlayer.play(url: url, id: id, rate: speed)
+            } catch {}
         }
     }
 
