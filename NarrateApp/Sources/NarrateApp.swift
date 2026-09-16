@@ -15,6 +15,14 @@ struct NarrateApp: App {
         .windowResizability(.contentMinSize)
         .defaultSize(width: ContentView.homeSize.width, height: ContentView.homeSize.height)
         .commands {
+            CommandGroup(after: .appInfo) {
+                if case .available(let r) = model.updater.state {
+                    Button("Update to Narrate \(r.version)…") { model.updater.install() }.disabled(model.isGenerating)
+                } else {
+                    Button("Check for Updates…") { Task { await model.updater.check(interactive: true) } }
+                        .disabled(model.updater.isBusy)
+                }
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Open PDF…") { model.chooseFile() }.keyboardShortcut("o")
                 Button("New Document") { model.closeReader() }.keyboardShortcut("n").disabled(!model.showReader)

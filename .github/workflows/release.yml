@@ -33,11 +33,16 @@ jobs:
       - name: Keep a stable file name for the "latest" link
         run: cp dist/Narrate-*-arm64.dmg dist/Narrate.dmg
 
+      - name: Zip the app for in-app updates
+        run: ditto -c -k --keepParent dist/Narrate.app dist/Narrate.zip
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: Narrate-dmg
-          path: dist/*.dmg
+          path: |
+            dist/*.dmg
+            dist/Narrate.zip
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
@@ -52,7 +57,9 @@ jobs:
 
           **First open:** macOS will say *"Apple could not verify Narrate is free of malware"* because this build
           isn't notarized yet. Click **Done**, open **System Settings ▸ Privacy & Security**, scroll down and click
-          **Open Anyway**. You only do this once.
+          **Open Anyway**. You only do this once — after that Narrate updates itself from here
+          (Narrate ▸ Check for Updates…, or automatically once a day; turn that off under Options).
+          `Narrate.zip` is what the in-app updater downloads.
           NOTES
-          gh release create "$GITHUB_REF_NAME" dist/Narrate-*-arm64.dmg dist/Narrate.dmg \
+          gh release create "$GITHUB_REF_NAME" dist/Narrate-*-arm64.dmg dist/Narrate.dmg dist/Narrate.zip \
             --title "Narrate $GITHUB_REF_NAME" --notes-file notes.md --generate-notes

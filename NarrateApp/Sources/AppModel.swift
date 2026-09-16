@@ -78,6 +78,7 @@ final class AppModel {
     let player = Player()
     let samplePlayer = SamplePlayer()
     let browser = BrowserController()
+    let updater = Updater()
     /// Voice previews live on disk (Application Support/Narrate/samples/<key>/), rendered once per voice
     /// in the background right after the engine comes up, so pressing play is instant from then on.
     private var sampleKey = "default"
@@ -112,6 +113,8 @@ final class AppModel {
     func start() {
         guard !started else { return }
         started = true
+        updater.onMessage = { [weak self] text, isError in self?.showToast(text, isError: isError) }
+        updater.checkAutomatically()
         Task { await bootstrap() }
     }
 

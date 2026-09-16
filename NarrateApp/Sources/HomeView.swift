@@ -49,6 +49,18 @@ struct HomeView: View {
                             ForEach(model.formats, id: \.self) { Text($0.uppercased()).tag($0) }
                         }
                         .pickerStyle(.segmented).frame(maxWidth: 220)
+                        LabeledContent("Updates") {
+                            HStack(spacing: 12) {
+                                @Bindable var updater = model.updater
+                                Toggle("Check automatically", isOn: $updater.automatic).toggleStyle(.checkbox)
+                                Spacer()
+                                Text("v\(Updater.currentVersion)").foregroundStyle(.tertiary).monospacedDigit()
+                                Button(model.updater.state == .checking ? "Checking…" : "Check Now") {
+                                    Task { await model.updater.check(interactive: true) }
+                                }
+                                .controlSize(.small).disabled(model.updater.isBusy)
+                            }
+                        }
                     } label: {
                         HStack {
                             Text("Options")
@@ -65,6 +77,7 @@ struct HomeView: View {
             .contentMargins(.bottom, 96, for: .scrollContent)   // room to scroll clear of the floating action
         }
         .overlay(alignment: .bottom) { footer }
+        .overlay(alignment: .top) { UpdateBanner().padding(.top, 10) }
         .background(.background)
         .dropDestination(for: URL.self) { urls, _ in
             model.open(urls); return true
@@ -367,6 +380,47 @@ struct StatusPill: View {
         case .ready: return "Ready"
         case .failed: return "Engine error"
         }
+    }
+}
+
+/// A small pill at the top of the setup screen while a newer release is available or installing.
+struct UpdateBanner: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let u = model.updater
+        Group {
+            switch u.state {
+            case .available(let r):
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.down.circle.fill").foregroundStyle(Color.accentColor)
+                    Text("Narrate \(r.version) is available").font(.callout)
+                    Button("What's New") { NSWorkspace.shared.open(r.pageURL) }.buttonStyle(.link).font(.callout)
+                    Button("Update") { u.install() }
+                        .prominentGlassButton().controlSize(.small)
+                        .disabled(model.isGenerating)
+                        .help(model.isGenerating ? "Wait for the current audiobook to finish" : "Download and relaunch as \(r.version)")
+                    Button { u.skip() } label: { Image(systemName: "xmark").font(.caption.weight(.semibold)) }
+                        .buttonStyle(.plain).foregroundStyle(.secondary).help("Not now")
+                }
+            case .downloading(let f):
+                HStack(spacing: 10) {
+                    ProgressView(value: f).progressViewStyle(.linear).frame(width: 140)
+                    Text("Downloading update… \(Int(f * 100))%").font(.callout).monospacedDigit()
+                }
+            case .installing:
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Installing — Narrate will reopen in a moment").font(.callout)
+                }
+            default:
+                EmptyView()
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .glassPanel(cornerRadius: 12)
+        .transition(.move(edge: .top).combined(with: .opacity))
+        .animation(.snappy, value: u.state)
     }
 }
 

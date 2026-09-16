@@ -78,6 +78,10 @@ and staples the tickets — the DMG then opens on any Mac with no warnings.
    your iPhone or iPad, **Share** offers Messages/Mail/Notes etc., and **Export ▸ Save a Copy…**
    (⇧⌘E) drops a copy anywhere — e.g. iCloud Drive for the Files app. *Show in Finder* reveals the
    original.
+8. Updates come from GitHub Releases: Narrate checks once a day (toggle under *Options*) and offers
+   a one-click update — it downloads `Narrate.zip`, swaps itself out and relaunches. *Narrate ▸ Check
+   for Updates…* checks right away. Because the app downloads the update itself, there's no Gatekeeper
+   prompt the second time round.
 
 ## Layout
 
@@ -96,6 +100,7 @@ NarrateApp/Sources/
   Player.swift                  AVAudioPlayer wrappers
   Models.swift                  voices, documents, narration + sidecar format
   Glass.swift                   Liquid Glass (macOS 26) / material (macOS 15) styling helpers
+  Updater.swift                 in-app updates from GitHub Releases (Narrate.zip)
 NarrateApp/Resources/           Info.plist, icon generator
 engine/narrate_engine.py        the Python side: stdin/stdout JSON server (streams chunks, honours skip-ahead)
 engine/narrate/tts.py           Kokoro engine, chunking, word timings, encoding
