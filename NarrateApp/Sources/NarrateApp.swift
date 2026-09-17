@@ -25,6 +25,8 @@ struct NarrateApp: App {
             }
             CommandGroup(replacing: .newItem) {
                 Button("Open PDF…") { model.chooseFile() }.keyboardShortcut("o")
+                Button("Choose Pages…") { model.openPagePicker() }.keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(model.document?.isPDF != true || model.showReader)
                 Button("New Document") { model.closeReader() }.keyboardShortcut("n").disabled(!model.showReader)
             }
             CommandGroup(after: .pasteboard) {
@@ -52,6 +54,13 @@ struct NarrateApp: App {
         .defaultSize(width: 1100, height: 820)
         .windowResizability(.contentMinSize)
         .restorationBehavior(.disabled)   // never bring back an empty browser window on launch
+
+        Window("Choose Pages", id: "pages") {
+            PagePickerWindow().environment(model)
+        }
+        .defaultSize(width: 1180, height: 820)
+        .windowResizability(.contentMinSize)
+        .restorationBehavior(.disabled)
     }
 }
 
@@ -76,6 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// Switches between the setup screen and the reader, resizing the window to suit each.
 struct ContentView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
     @State private var window: NSWindow?
 
     static let homeSize = CGSize(width: 560, height: 780)
@@ -90,6 +100,7 @@ struct ContentView: View {
             }
         }
         .background(WindowAccessor(window: $window))
+        .onAppear { model.openWindow = { openWindow(id: $0) } }
         .onChange(of: model.showReader) { _, reading in
             resize(to: reading ? Self.readerSize : Self.homeSize, grow: reading)
         }

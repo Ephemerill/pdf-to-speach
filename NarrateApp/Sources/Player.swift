@@ -10,8 +10,15 @@ import Observation
 final class Player {
     private(set) var isPlaying = false
     private(set) var isWaiting = false          // wants to play but the next chunk isn't ready yet
-    private(set) var currentTime: Double = 0
     private(set) var currentChunk = 0
+    /// Seconds into `currentChunk`. The position is kept chunk-relative on purpose: while a book is
+    /// still being generated the chunk offsets shift as the duration estimate improves, and an
+    /// absolute time would drift onto different words (visibly so when paused).
+    private(set) var within: Double = 0
+    var currentTime: Double {
+        guard let t = timeline, t.offsets.indices.contains(currentChunk) else { return 0 }
+        return t.offsets[currentChunk] + within
+    }
     var duration: Double { timeline?.duration ?? 0 }
     var rate: Float = 1 {
         didSet { if isPlaying, !isWaiting { queue.rate = rate } }
@@ -50,7 +57,7 @@ final class Player {
         stop()
         timeline = t
         currentChunk = 0
-        currentTime = 0
+        within = 0
     }
 
     func stop() {
@@ -61,7 +68,7 @@ final class Player {
         pendingSeek = nil
         isPlaying = false; isWaiting = false
         timeline = nil
-        currentTime = 0; currentChunk = 0
+        within = 0; currentChunk = 0
     }
 
     /// Called when chunk `index` has been synthesized.
@@ -113,7 +120,8 @@ final class Player {
     func seek(to time: Double) {
         guard let t = timeline else { return }
         let (k, within) = t.locate(max(0, min(time, max(0, t.duration - 0.05))))
-        currentTime = time
+        currentChunk = k
+        self.within = within
         if t.chunks[k].isReady {
             pendingSeek = nil
             if let item = queue.currentItem, itemChunk[ObjectIdentifier(item)] == k {
@@ -158,6 +166,7 @@ final class Player {
         var i = k
         while i < t.chunks.count, t.chunks[i].isReady { append(chunk: i); i += 1 }
         currentChunk = k
+        within = seekWithin
         if seekWithin > 0, let item = queue.currentItem {
             item.seek(to: CMTime(seconds: seekWithin, preferredTimescale: 1000), completionHandler: nil)
         }
@@ -178,11 +187,12 @@ final class Player {
         if next >= t.chunks.count {
             isPlaying = false; isWaiting = false
             currentChunk = k
-            currentTime = t.duration
+            within = t.estimatedDuration(of: t.chunks[k])
         } else if t.chunks[next].isReady {
             enqueue(from: next, seekWithin: 0)
         } else {
             currentChunk = next
+            within = 0
             isWaiting = true
             onNeedChunk?(next)
         }
@@ -191,8 +201,8 @@ final class Player {
     private func tick() {
         guard let t = timeline, pendingSeek == nil else { return }   // parked on a seek: keep showing its target
         if let item = queue.currentItem, let k = itemChunk[ObjectIdentifier(item)], t.offsets.indices.contains(k) {
-            let within = item.currentTime().seconds
-            if within.isFinite { currentTime = t.offsets[k] + within }
+            let secs = item.currentTime().seconds
+            if secs.isFinite { currentChunk = k; within = secs }
         }
     }
 }

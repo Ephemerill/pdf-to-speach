@@ -34,16 +34,140 @@ struct Voice: Identifiable, Hashable {
 
 // MARK: - Source document
 
+/// A chapter (or any bookmark/heading) of a PDF and the pages it spans.
+struct OutlineEntry: Identifiable, Equatable {
+    let id: Int
+    var title: String
+    var level: Int              // 1 = top level
+    var first: Int              // 1-based, inclusive
+    var last: Int
+    var pages: ClosedRange<Int> { first...max(first, last) }
+}
+
 struct SourceDocument: Equatable {
     var name: String
     var path: String?          // nil for pasted / captured text
     var pages: Int             // 0 when not a PDF
-    var paragraphs: [String]
     var method: String?        // how a web capture got its text
 
-    var words: Int { paragraphs.reduce(0) { $0 + $1.split(separator: " ").count } }
-    var preview: String { String(paragraphs.joined(separator: "\n\n").prefix(600)) }
+    /// Pasted / captured text, already in paragraphs.
+    private var text: [String] = []
+    /// PDFs: cleaned text blocks per page (index 0 = page 1). Everything the file has, so any set of
+    /// pages can be narrated without going back to the engine.
+    private(set) var pageBlocks: [[String]] = []
+    private var pageWords: [Int] = []
+    var outline: [OutlineEntry] = []
+    var outlineSource = "none"
+    /// PDFs: the 1-based page numbers that will be narrated. Everything else in the file is ignored —
+    /// the preview, the word count and the reader only ever see these pages.
+    var selection = IndexSet()
+
+    init(name: String, path: String?, pages: Int, paragraphs: [String], method: String?) {
+        self.name = name; self.path = path; self.pages = pages; self.method = method
+        text = paragraphs
+    }
+
+    init(pdfName name: String, path: String, pageBlocks: [[String]], outline: [OutlineEntry], outlineSource: String) {
+        self.name = name; self.path = path; self.pages = pageBlocks.count
+        self.pageBlocks = pageBlocks
+        pageWords = pageBlocks.map { $0.reduce(0) { $0 + $1.split(separator: " ").count } }
+        self.outline = outline; self.outlineSource = outlineSource
+        selection = IndexSet(1...max(1, pages))
+    }
+
     var isPDF: Bool { pages > 0 }
+
+    /// The paragraphs that will be narrated.
+    var paragraphs: [String] {
+        guard isPDF else { return text }
+        return Self.join(pageBlocks, pages: selection)
+    }
+
+    var words: Int {
+        isPDF ? selection.reduce(0) { $0 + (pageWords.indices.contains($1 - 1) ? pageWords[$1 - 1] : 0) }
+              : text.reduce(0) { $0 + $1.split(separator: " ").count }
+    }
+
+    var preview: String {
+        guard isPDF else { return String(text.joined(separator: "\n\n").prefix(600)) }
+        var out = ""
+        for p in selection where pageBlocks.indices.contains(p - 1) {
+            for b in pageBlocks[p - 1] {
+                out += (out.isEmpty ? "" : "\n\n") + b
+                if out.count > 600 { return String(out.prefix(600)) }
+            }
+        }
+        return out
+    }
+
+    /// Blocks of the selected pages → paragraphs. A paragraph cut by a page break is re-joined, but
+    /// only across pages that are both selected and adjacent (mirrors the engine's join_paragraphs).
+    static func join(_ blocks: [[String]], pages: IndexSet) -> [String] {
+        var out: [String] = []
+        for range in pages.rangeView {
+            var joinable = false
+            for p in range where blocks.indices.contains(p - 1) {
+                for b in blocks[p - 1] {
+                    if joinable, let last = out.last, !last.hasSuffix(where: ".!?\":)"), let c = b.first, c.isLowercase {
+                        out[out.count - 1] = last + " " + b
+                    } else {
+                        out.append(b)
+                    }
+                    joinable = true
+                }
+            }
+        }
+        return out
+    }
+
+    // MARK: Selection
+
+    var selectedRanges: [ClosedRange<Int>] { selection.rangeView.map { $0.lowerBound...($0.upperBound - 1) } }
+    var isEverythingSelected: Bool { selection.count == pages }
+
+    /// "Pages 6–13, 24–50" / "All 300 pages" / "No pages selected".
+    var selectionSummary: String {
+        if selection.isEmpty { return "No pages selected" }
+        if isEverythingSelected { return "All \(pages) pages" }
+        return "Pages " + rangesText
+    }
+
+    /// The selection the way people type it: "6-13, 24-50".
+    var rangesText: String {
+        selectedRanges.map { $0.lowerBound == $0.upperBound ? "\($0.lowerBound)" : "\($0.lowerBound)-\($0.upperBound)" }
+            .joined(separator: ", ")
+    }
+
+    /// "6-13, 24-50" (or "6–13; 24 to 50", any separators) → pages, clamped to the document. nil when
+    /// nothing in it parses.
+    static func parseRanges(_ text: String, pages: Int) -> IndexSet? {
+        var set = IndexSet()
+        let parts = text.replacingOccurrences(of: "–", with: "-").replacingOccurrences(of: "—", with: "-")
+            .replacingOccurrences(of: " to ", with: "-")
+            .components(separatedBy: CharacterSet(charactersIn: ",;\n"))
+        var any = false
+        for part in parts {
+            let nums = part.components(separatedBy: "-").map { Int($0.trimmingCharacters(in: .whitespaces)) }
+            guard !nums.isEmpty, nums.allSatisfy({ $0 != nil }) else { continue }
+            let a = nums[0]!, b = nums.count > 1 ? nums.last!! : a
+            let lo = max(1, min(a, b)), hi = min(pages, max(a, b))
+            guard lo <= hi else { continue }
+            set.insert(integersIn: lo...hi)
+            any = true
+        }
+        return any ? set : nil
+    }
+
+    func isSelected(_ e: OutlineEntry) -> Bool { selection.contains(integersIn: e.pages) }
+    func isPartlySelected(_ e: OutlineEntry) -> Bool { !isSelected(e) && selection.intersects(integersIn: e.pages) }
+
+    mutating func setSelected(_ e: OutlineEntry, _ on: Bool) {
+        if on { selection.insert(integersIn: e.pages) } else { selection.remove(integersIn: e.pages) }
+    }
+}
+
+private extension String {
+    func hasSuffix(where chars: String) -> Bool { last.map { chars.contains($0) } ?? false }
 }
 
 // MARK: - Finished narration (+ .narrate.json sidecar so audio files can be re-opened later)

@@ -3,7 +3,6 @@ import UniformTypeIdentifiers
 
 struct HomeView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.openWindow) private var openWindow
     @State private var isDropTargeted = false
     @State private var showOptions = false
 
@@ -100,13 +99,22 @@ struct HomeView: View {
 
     private var dropZone: some View {
         VStack(spacing: 10) {
-            Image(systemName: "doc.richtext")
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(isDropTargeted ? Color.accentColor : .secondary)
-            VStack(spacing: 3) {
-                Text("Drop a PDF here").font(.headline)
-                Text("or ").foregroundStyle(.secondary) +
-                Text("choose a file…").foregroundStyle(Color.accentColor)
+            if model.isExtracting {
+                ProgressView().controlSize(.regular)
+                VStack(spacing: 3) {
+                    Text(model.extractLabel).font(.headline).lineLimit(1)
+                    Text("Big files take a moment — every page is read once, then you pick what to narrate.")
+                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }
+            } else {
+                Image(systemName: "doc.richtext")
+                    .font(.system(size: 34, weight: .light))
+                    .foregroundStyle(isDropTargeted ? Color.accentColor : .secondary)
+                VStack(spacing: 3) {
+                    Text("Drop a PDF here").font(.headline)
+                    Text("or ").foregroundStyle(.secondary) +
+                    Text("choose a file…").foregroundStyle(Color.accentColor)
+                }
             }
         }
         .frame(maxWidth: .infinity).frame(height: 150)
@@ -120,7 +128,7 @@ struct HomeView: View {
                 .foregroundStyle(isDropTargeted ? Color.accentColor : Color.primary.opacity(0.18))
         )
         .contentShape(Rectangle())
-        .onTapGesture { model.chooseFile() }
+        .onTapGesture { if !model.isExtracting { model.chooseFile() } }
         .animation(.easeOut(duration: 0.15), value: isDropTargeted)
     }
 
@@ -147,26 +155,33 @@ struct HomeView: View {
 
     private var linkPane: some View {
         @Bindable var model = model
+        let hasLink = BrowserController.webURL(from: model.linkText) != nil
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
-                TextField("URL", text: $model.linkText, prompt: Text("https://www.jstor.org/stable/…"))
+                TextField("URL", text: $model.linkText, prompt: Text("Paste a link to an article…"))
                     .textFieldStyle(.roundedBorder).labelsHidden()
-                    .onSubmit { model.openLink(openWindow: { openWindow(id: $0) }) }
-                Button("Open") { model.openLink(openWindow: { openWindow(id: $0) }) }
-                    .disabled(model.linkText.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
-            Button {
-                model.capturePage()
-            } label: {
-                HStack {
-                    if model.isCapturing { ProgressView().controlSize(.small) }
-                    Text(model.isCapturing ? model.captureLabel : "Capture Page Text")
+                    .onSubmit { model.readArticle() }
+                    // Pasting a whole link into the empty field is the whole gesture — no button needed.
+                    .onChange(of: model.linkText) { old, new in
+                        if old.isEmpty, new.count > 12, BrowserController.webURL(from: new) != nil, !model.isCapturing { model.readArticle() }
+                    }
+                Button {
+                    model.readArticle()
+                } label: {
+                    HStack(spacing: 6) {
+                        if model.isCapturing { ProgressView().controlSize(.small) }
+                        Text(model.isCapturing ? model.captureLabel : "Read Article")
+                    }
                 }
-                .frame(maxWidth: .infinity)
+                .buttonStyle(.borderedProminent)
+                .disabled(!hasLink || model.isCapturing)
             }
-            .buttonStyle(.bordered)
-            .disabled(!model.browser.isOpen || model.isCapturing)
-            Text("Opens the page in Narrate's own browser window — sign in if you need to, get the article on screen, then hit Capture. Page scans (JSTOR's reader) and screenshots are read with on-device OCR.")
+            HStack {
+                Button("Open in Browser…") { model.openLink() }.disabled(!hasLink || model.isCapturing)
+                Button("Capture Page Text") { model.capturePage() }.disabled(!model.browser.isOpen || model.isCapturing)
+            }
+            .controlSize(.small)
+            Text("Narrate reads the article itself — no menus, ads or comments — and links to PDFs are downloaded. For pages behind a login (JSTOR, university proxies…), open the browser, sign in, get the article on screen, then Capture Page Text; page scans are read with on-device OCR.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -238,27 +253,106 @@ struct DocumentCard: View {
                     .buttonStyle(.plain).help("Remove")
             }
             .padding(.vertical, 2)
-            if doc.isPDF {
-                LabeledContent("Pages") {
-                    HStack(spacing: 6) {
-                        TextField("From", text: $model.pageFrom, prompt: Text("1")).frame(width: 52)
-                        Text("–").foregroundStyle(.secondary)
-                        TextField("To", text: $model.pageTo, prompt: Text("\(doc.pages)")).frame(width: 52)
-                        Button("Apply") { model.applyPageRange() }.controlSize(.small)
-                    }
-                    .textFieldStyle(.roundedBorder).labelsHidden().multilineTextAlignment(.center)
-                }
-            }
         } header: {
             Text("Document")
         }
+        if doc.isPDF { PageSelectionSection(doc: doc) }
     }
 
     private var meta: String {
         let mins = Double(doc.words) / (165 * model.speed)
-        var s = (doc.isPDF ? "\(doc.pages) pages · " : "") + "\(doc.words.formatted()) words · about \(Format.time(mins * 60)) of audio"
+        var s = (doc.isPDF ? "\(doc.selection.count) of \(doc.pages) pages · " : "")
+            + "\(doc.words.formatted()) words · about \(Format.time(mins * 60)) of audio"
         if let m = doc.method { s += " · via \(m)" }
         return s
+    }
+}
+
+/// Which pages of the PDF get narrated: typed ranges, the chapter list, or the page picker window.
+/// Everything below — word count, preview, the reader — follows this selection.
+struct PageSelectionSection: View {
+    @Environment(AppModel.self) private var model
+    let doc: SourceDocument
+    @State private var showChapters = true
+
+    var body: some View {
+        @Bindable var model = model
+        Section {
+            HStack(spacing: 8) {
+                TextField("Pages", text: $model.rangesText, prompt: Text("e.g. 6-13, 24-50"))
+                    .textFieldStyle(.roundedBorder).labelsHidden()
+                    .onSubmit { model.applyRanges() }
+                    .help("Page ranges to narrate, separated by commas. Leave empty for the whole file.")
+                Button("Apply") { model.applyRanges() }
+                    .disabled(model.rangesText == doc.rangesText)
+                Button { model.openPagePicker() } label: { Label("Choose Pages…", systemImage: "doc.text.magnifyingglass") }
+                    .help("Flip through the PDF and mark the pages to narrate")
+            }
+            .controlSize(.small)
+
+            if !doc.outline.isEmpty {
+                DisclosureGroup(isExpanded: $showChapters) {
+                    ChapterList(doc: doc, maxHeight: 280)
+                } label: {
+                    HStack {
+                        Text(doc.outlineSource == "bookmarks" ? "Chapters" : "Chapters (detected from headings)")
+                        Spacer()
+                        Text("\(doc.outline.filter(doc.isSelected).count) of \(doc.outline.count) selected")
+                            .foregroundStyle(.secondary).monospacedDigit()
+                    }
+                }
+            }
+        } header: {
+            HStack {
+                Text("Pages to narrate")
+                Spacer()
+                Text(doc.selectionSummary).foregroundStyle(.secondary).monospacedDigit().lineLimit(1).truncationMode(.middle)
+                if !doc.isEverythingSelected {
+                    Button("All") { model.selectAllPages() }.buttonStyle(.link).font(.caption)
+                }
+            }
+        }
+    }
+}
+
+/// Checkbox per chapter; ticking one selects its pages, clicking its name jumps the page picker there.
+struct ChapterList: View {
+    @Environment(AppModel.self) private var model
+    let doc: SourceDocument
+    var maxHeight: CGFloat? = nil
+    var onJump: ((Int) -> Void)? = nil
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(doc.outline) { e in
+                    HStack(spacing: 6) {
+                        Toggle(isOn: Binding(get: { doc.isSelected(e) }, set: { model.setSelected(e, $0) })) { EmptyView() }
+                            .toggleStyle(.checkbox).labelsHidden()
+                            .overlay {   // half-ticked when only some of its pages are in
+                                if doc.isPartlySelected(e) {
+                                    Image(systemName: "minus").font(.system(size: 8, weight: .heavy)).foregroundStyle(Color.accentColor)
+                                        .allowsHitTesting(false)
+                                }
+                            }
+                        Text(e.title).lineLimit(1).truncationMode(.tail)
+                            .font(e.level == 1 ? .body : .callout)
+                            .foregroundStyle(e.level == 1 ? .primary : .secondary)
+                        Spacer(minLength: 4)
+                        Text(e.first == e.last ? "p. \(e.first)" : "pp. \(e.first)–\(e.last)")
+                            .font(.caption).foregroundStyle(.tertiary).monospacedDigit()
+                    }
+                    .padding(.leading, CGFloat(max(0, e.level - 1)) * 18)
+                    .padding(.vertical, 1)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if let onJump { onJump(e.first) } else { model.setSelected(e, !doc.isSelected(e)) }
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .frame(maxHeight: maxHeight)
     }
 }
 

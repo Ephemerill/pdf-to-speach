@@ -1,6 +1,6 @@
 # Narrate
 
-Turn PDFs, pasted text, or articles behind a login (JSTOR, university proxies…) into
+Turn PDFs, pasted text, web articles, or papers behind a login (JSTOR, university proxies…) into
 audiobooks — and read along with word-by-word highlighting. A native Mac app; everything
 runs on your machine. No accounts, no API keys, nothing leaves the Mac.
 
@@ -59,12 +59,21 @@ and staples the tickets — the DMG then opens on any Mac with no warnings.
 
 ## Using it
 
-1. **PDF** — drop it on the window (or the Dock icon), or click to browse. You can narrow to a page range.
+1. **PDF** — drop it on the window (or the Dock icon), or click to browse. Every page is read once,
+   and the file's chapters are listed (from its bookmarks, or detected from headings when it has
+   none). Tick the chapters you want, type page ranges (`6-13, 24-50` — as many as you like in one
+   audiobook), or open **Choose Pages…** to flip through the PDF itself: pages that won't be
+   narrated are veiled, and Start Here / End Here marks a run of pages while you scroll. The word
+   count, the preview and the reader only ever show what's selected.
 2. **Text** — paste anything; blank lines separate paragraphs.
-3. **Link** — paste a URL and hit *Open*. Narrate opens its own browser window; sign in or solve the
-   site's bot check if asked (logins stick between runs). Once the article is on screen, hit
-   **Capture Page Text**. It tries, in order: page-scan images → OCR (JSTOR's viewer), the article's
-   text, then scroll-and-screenshot → OCR. Running headers, page numbers and footnotes are stripped.
+3. **Link** — paste a URL (or drag a link in) and Narrate reads the article: the page loads in a
+   hidden web view and a Reader-style extractor pulls out the body text — no menus, ads, share bars,
+   comments, footnote markers or endnotes — plus the title and author. Links straight to a PDF are
+   downloaded to `~/Downloads` and opened like any PDF. If there's no article to be had (a login
+   wall, a bot check, JSTOR's page scans), the built-in browser window opens on that page instead:
+   sign in if asked (logins stick between runs), get the article on screen, then hit **Capture Page
+   Text**. Capture tries, in order: page-scan images → OCR (JSTOR's viewer), the article's text,
+   then scroll-and-screenshot → OCR. Running headers, page numbers and footnotes are stripped.
 4. Pick a voice: click the voice row (or ⇧⌘V) for a grid of sixteen colour orbs, one per voice —
    hover one to hear it, click to choose. Previews are instant because samples are rendered once in
    the background and cached. Speed and format live under *Options* (1× MP3 by default; your
@@ -94,8 +103,10 @@ NarrateApp/Sources/
   HomeView.swift                setup screen (source, document, voices, options)
   ReaderView.swift              reader screen + player bar
   ReadAlongTextView.swift       NSTextView-based read-along with word highlighting
-  Browser.swift                 built-in capture browser window (WKWebView)
-  Capture.swift                 page images / DOM text / screenshots → Vision OCR → paragraphs
+  PagePicker.swift              the Choose Pages window (PDFKit viewer, chapters, page ranges)
+  Browser.swift                 the WKWebView behind links (hidden loads, PDF downloads) + its window
+  Article.swift                 Reader-style article extraction (runs in the page as JS)
+  Capture.swift                 page images / article text / screenshots → Vision OCR → paragraphs
   Engine.swift                  JSON-lines bridge to the Python engine subprocess
   ModelDownloader.swift         one-time model download with progress
   Player.swift                  AVAudioPlayer wrappers
@@ -106,7 +117,7 @@ NarrateApp/Sources/
 NarrateApp/Resources/           Info.plist, icon generator
 engine/narrate_engine.py        the Python side: stdin/stdout JSON server (streams chunks, honours skip-ahead)
 engine/narrate/tts.py           Kokoro engine, chunking, word timings, encoding
-engine/narrate/pdf_text.py      PDF text extraction + cleanup
+engine/narrate/pdf_text.py      PDF text extraction (per page) + cleanup + chapter outline
 legacy/                         the original pywebview version (kept for reference)
 ```
 

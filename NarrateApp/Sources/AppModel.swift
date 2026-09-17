@@ -44,8 +44,10 @@ final class AppModel {
     var document: SourceDocument?
     var pastedText = ""
     var linkText = ""
-    var pageFrom = ""
-    var pageTo = ""
+    /// The page-range field on the document card ("6-13, 24-50"); applied on submit.
+    var rangesText = ""
+    var isExtracting = false
+    var extractLabel = "Reading PDF…"
 
     var showVoicePicker = false
 
@@ -75,6 +77,8 @@ final class AppModel {
 
     // Feedback
     var toast: (text: String, isError: Bool)?
+    /// Opens one of the app's `Window` scenes by id; the root view hands this in (it lives in the SwiftUI environment).
+    var openWindow: (String) -> Void = { _ in }
 
     let engine = Engine()
     let player = Player()
@@ -116,6 +120,10 @@ final class AppModel {
         guard !started else { return }
         started = true
         updater.onMessage = { [weak self] text, isError in self?.showToast(text, isError: isError) }
+        browser.onDownloadedPDF = { [weak self] file in
+            self?.showToast("Saved the PDF to Downloads.", isError: false)
+            self?.openPDF(file)
+        }
         updater.checkAutomatically()
         Task { await bootstrap() }
     }
@@ -176,6 +184,11 @@ final class AppModel {
             pendingOpen = urls
             return
         }
+        guard leaveReader() else { return }
+        // A link dragged in from a browser.
+        if let web = urls.first(where: { ["http", "https"].contains($0.scheme?.lowercased() ?? "") }) {
+            readArticle(web.absoluteString); return
+        }
         for url in urls {
             let ext = url.pathExtension.lowercased()
             if ext == "pdf" { openPDF(url); return }
@@ -185,7 +198,20 @@ final class AppModel {
                 if FileManager.default.fileExists(atPath: sidecar.path) { reopen(sidecar: sidecar); return }
             }
         }
-        showToast("Drop a PDF (or an audiobook Narrate made earlier).", isError: true)
+        showToast("Drop a PDF, a link, or an audiobook Narrate made earlier.", isError: true)
+    }
+
+    /// A new document arrived while the reader was showing an earlier audiobook: go back to the
+    /// setup screen so it can be looked over (and pages chosen) instead of loading behind the reader.
+    /// A generation in progress is never thrown away by an accidental drop.
+    private func leaveReader() -> Bool {
+        guard showReader else { return true }
+        if isGenerating {
+            showToast("An audiobook is still being generated — cancel it first (⌘N) to open something else.", isError: true)
+            return false
+        }
+        closeReader()
+        return true
     }
 
     func chooseFile() {
@@ -195,21 +221,32 @@ final class AppModel {
         if panel.runModal() == .OK, let url = panel.url { open([url]) }
     }
 
-    func openPDF(_ url: URL, first: Int? = nil, last: Int? = nil) {
+    /// Read the whole file once — every page's text plus its chapters — then let the user pick pages.
+    func openPDF(_ url: URL) {
+        guard !isExtracting, leaveReader() else { return }
+        isExtracting = true
+        extractLabel = "Reading \(url.lastPathComponent)…"
+        source = .pdf
         Task {
+            defer { isExtracting = false }
             do {
-                var args: Engine.JSON = ["path": url.path]
-                if let first { args["first"] = first }
-                if let last { args["last"] = last }
-                let r = try await engine.call("extract", args)
-                let paras = r["paragraphs"] as? [String] ?? []
-                guard !paras.isEmpty else {
+                let r = try await engine.call("extract", ["path": url.path]) { p in
+                    if let label = p["label"] as? String { Task { @MainActor in self.extractLabel = label } }
+                }
+                let blocks = r["page_blocks"] as? [[String]] ?? []
+                guard blocks.contains(where: { !$0.isEmpty }) else {
                     showToast("No readable text found. This PDF looks like scanned images.", isError: true); return
                 }
-                let keepRange = first != nil || last != nil
-                setDocument(SourceDocument(name: r["name"] as? String ?? url.lastPathComponent, path: url.path,
-                                           pages: r["pages"] as? Int ?? 0, paragraphs: paras, method: nil), keepPages: keepRange)
-                source = .pdf
+                let outline = (r["outline"] as? [[String: Any]] ?? []).enumerated().map { i, e in
+                    OutlineEntry(id: i, title: e["title"] as? String ?? "Untitled", level: e["level"] as? Int ?? 1,
+                                 first: e["first"] as? Int ?? 1, last: e["last"] as? Int ?? 1)
+                }
+                setDocument(SourceDocument(pdfName: r["name"] as? String ?? url.lastPathComponent, path: url.path,
+                                           pageBlocks: blocks, outline: outline,
+                                           outlineSource: r["outline_source"] as? String ?? "none"))
+                if !outline.isEmpty, blocks.count > 30 {
+                    showToast("Found \(outline.count) chapters — tick the ones you want, or choose pages.", isError: false)
+                }
             } catch {
                 showToast("Couldn't read that PDF: \(error.localizedDescription)", isError: true)
             }
@@ -217,6 +254,8 @@ final class AppModel {
     }
 
     func useText() {
+        // Someone pasted a link into the text box: treat it as one.
+        if BrowserController.webURL(from: pastedText) != nil { readArticle(pastedText); return }
         let paras = pastedText.components(separatedBy: #"\n\s*\n"#, regex: true)
             .map { $0.replacing(regex: #"\s+"#, with: " ").trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
@@ -225,18 +264,50 @@ final class AppModel {
         setDocument(SourceDocument(name: title, path: nil, pages: 0, paragraphs: paras, method: nil))
     }
 
-    func applyPageRange() {
-        guard let doc = document, let path = doc.path else { return }
-        openPDF(URL(fileURLWithPath: path), first: Int(pageFrom.trimmingCharacters(in: .whitespaces)),
-                last: Int(pageTo.trimmingCharacters(in: .whitespaces)))
-    }
-
-    private func setDocument(_ doc: SourceDocument, keepPages: Bool = false) {
+    private func setDocument(_ doc: SourceDocument) {
         document = doc
-        if !keepPages { pageFrom = ""; pageTo = "" }
+        rangesText = doc.isPDF ? doc.rangesText : ""
     }
 
-    func clearDocument() { document = nil }
+    func clearDocument() { document = nil; rangesText = "" }
+
+    // MARK: - Choosing pages
+
+    /// Commit whatever is typed in the ranges field ("6-13, 24-50").
+    func applyRanges() {
+        guard let doc = document, doc.isPDF else { return }
+        let text = rangesText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { document?.selection = IndexSet(1...doc.pages); syncRangesText(); return }
+        guard let set = SourceDocument.parseRanges(text, pages: doc.pages) else {
+            showToast("Type page ranges like 6-13, 24-50.", isError: true); return
+        }
+        document?.selection = set
+        syncRangesText()
+    }
+
+    func setPages(_ set: IndexSet) {
+        guard let doc = document, doc.isPDF else { return }
+        document?.selection = set.intersection(IndexSet(1...doc.pages))
+        syncRangesText()
+    }
+
+    func selectAllPages() { if let doc = document, doc.isPDF { setPages(IndexSet(1...doc.pages)) } }
+    func clearPages() { setPages([]) }
+
+    func select(_ range: ClosedRange<Int>, _ on: Bool) {
+        guard var doc = document, doc.isPDF else { return }
+        if on { doc.selection.insert(integersIn: range) } else { doc.selection.remove(integersIn: range) }
+        setPages(doc.selection)
+    }
+
+    func setSelected(_ entry: OutlineEntry, _ on: Bool) { select(entry.pages, on) }
+
+    private func syncRangesText() { rangesText = document?.rangesText ?? "" }
+
+    func openPagePicker() {
+        guard document?.isPDF == true else { return }
+        openWindow("pages")
+    }
 
     func reopen(sidecar: URL) {
         do {
@@ -249,10 +320,60 @@ final class AppModel {
         }
     }
 
+    // MARK: - Links
+
+    /// Paste a link, get the article: the page loads in the (possibly hidden) web view and the
+    /// readable text is pulled out of it. Links to PDFs are downloaded and opened like any PDF.
+    /// When there's no article to be found — a login wall, a bot check, JSTOR's page scans — the
+    /// browser window opens on the page so the user can deal with it and press Capture.
+    func readArticle(_ text: String? = nil) {
+        let raw = text ?? linkText
+        guard let url = BrowserController.webURL(from: raw) else {
+            showToast("That doesn't look like a web address.", isError: true); return
+        }
+        guard !isCapturing else { return }
+        linkText = url.absoluteString
+        source = .link
+        isCapturing = true
+        captureLabel = "Loading page…"
+        log.info("readArticle: \(url.absoluteString, privacy: .public)")
+        Task {
+            defer { isCapturing = false }
+            do {
+                switch try await browser.load(url) {
+                case .pdf(let file):
+                    showToast("That link is a PDF — saved it to Downloads.", isError: false)
+                    openPDF(file)
+                case .page:
+                    captureLabel = "Reading article…"
+                    await browser.settle()
+                    var article = try await Article.extract(browser.webView)
+                    if (article?.words ?? 0) < Article.minimumWords {   // client-rendered pages can be a beat late
+                        try await Task.sleep(for: .seconds(1.5))
+                        article = try await Article.extract(browser.webView)
+                    }
+                    guard let a = article, a.words >= Article.minimumWords else {
+                        log.info("readArticle: only \(article?.words ?? 0) words, falling back to the browser")
+                        openWindow("browser")
+                        showToast("Couldn't find an article there. If the page needs a login, sign in here, then press Capture Page Text.", isError: true)
+                        return
+                    }
+                    setDocument(SourceDocument(name: a.title, path: nil, pages: 0, paragraphs: a.spokenParagraphs, method: "article"))
+                    showToast("Read “\(a.title)” — \(a.words.formatted()) words.", isError: false)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            } catch {
+                log.error("readArticle failed: \(error.localizedDescription, privacy: .public)")
+                openWindow("browser")
+                showToast("Couldn't load that link: \(error.localizedDescription)", isError: true)
+            }
+        }
+    }
+
     // MARK: - Built-in browser
 
-    func openLink(openWindow: (String) -> Void) {
-        guard !linkText.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+    func openLink() {
+        guard BrowserController.webURL(from: linkText) != nil else { return }
         openWindow("browser")
         browser.load(linkText)
     }
@@ -370,10 +491,11 @@ final class AppModel {
 
     // MARK: - Generation
 
-    var canGenerate: Bool { status.isReady && document != nil && !isGenerating }
+    var canGenerate: Bool { status.isReady && document != nil && !isGenerating && !isExtracting }
 
     func generate() {
         guard canGenerate, let doc = document else { return }
+        if doc.isPDF, doc.selection.isEmpty { showToast("Choose at least one page or chapter first.", isError: true); return }
         isGenerating = true
         progress = GenerationProgress(label: "Warming up…")
         let voice = Voice.named(voiceID)

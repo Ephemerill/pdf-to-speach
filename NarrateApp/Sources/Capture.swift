@@ -7,7 +7,7 @@ import WebKit
 ///
 /// Strategy, in order:
 ///   1. Page-scan images (JSTOR-style viewers): fetch each page image → OCR with column-aware ordering.
-///   2. Article DOM text, when the page has a real text body.
+///   2. The article's text (Article.swift's Reader-style extractor), when the page has a real text body.
 ///   3. Scroll the page and screenshot the viewport step by step → OCR (works on anything visible).
 /// OCR runs on macOS's built-in Vision framework, so nothing extra is downloaded.
 enum Capture {
@@ -58,12 +58,17 @@ enum Capture {
             }
         }
 
-        // Strategy 2: DOM text.
+        // Strategy 2: the article's own text — the Reader-style extractor first, then the crude
+        // innerText of the main region for pages it can't make sense of.
+        if let a = try await Article.extract(web), a.words >= 200 {
+            progress("Reading article text…", 1)
+            return Result(title: a.title, paragraphs: a.spokenParagraphs, method: "article text")
+        }
         let dom = (try await eval(web, JS.domText) as? [String: Any]) ?? [:]
         let domParas = textToParagraphs(dom["text"] as? String ?? "")
         if wordCount(domParas) >= 200 {
             progress("Reading article text…", 1)
-            return Result(title: cleanTitle(dom["title"] as? String ?? title), paragraphs: domParas, method: "article text")
+            return Result(title: cleanTitle(dom["title"] as? String ?? title), paragraphs: domParas, method: "page text")
         }
 
         // Strategy 3: OCR the viewport screenshots, de-duplicating the overlap between frames.

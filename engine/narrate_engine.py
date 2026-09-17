@@ -2,7 +2,7 @@
 
 The Swift app launches this as a subprocess and talks JSON lines over stdin/stdout:
 
-    → {"id": 1, "op": "extract", "path": "/x.pdf", "first": null, "last": null}
+    → {"id": 1, "op": "extract", "path": "/x.pdf"}
     ← {"id": 1, "event": "progress", ...}          (zero or more, for long jobs)
     ← {"id": 1, "result": {...}}  |  {"id": 1, "error": "message"}
 
@@ -90,8 +90,11 @@ class Engine:
         return {"ready": True}
 
     def op_extract(self, req):
-        doc = pdf_text.extract(req["path"], req.get("first"), req.get("last"))
-        return {"name": doc.name, "path": doc.path, "pages": doc.pages, "paragraphs": doc.paragraphs}
+        rid = req["id"]
+        doc = pdf_text.extract(req["path"], req.get("first"), req.get("last"),
+                               progress=lambda label: self.progress(rid, label=label))
+        return {"name": doc.name, "path": doc.path, "pages": doc.pages, "page_blocks": doc.page_blocks,
+                "outline": [s.__dict__ for s in doc.outline], "outline_source": doc.outline_source}
 
     def op_sample(self, req):
         audio = self.tts.sample(req["voice"], float(req.get("speed", 1.0)))

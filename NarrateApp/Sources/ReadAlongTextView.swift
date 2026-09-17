@@ -5,12 +5,13 @@ import SwiftUI
 /// cheap to render: the text is laid out once, and only the ranges that change get re-attributed.
 ///
 /// Scrolling: the view follows the narration, but the moment you scroll it stops following and
-/// lets you read ahead or back. It picks the narration up again when the spoken word scrolls back
-/// into view, or when you click a word / seek.
+/// lets you read ahead or back. It picks the narration up again after ten seconds without a
+/// scroll (and only while something is playing), or at once when you click a word / seek.
 struct ReadAlongTextView: NSViewRepresentable {
     let timeline: Timeline
     let timelineVersion: Int
     let currentTime: Double
+    let isPlaying: Bool
     let bottomInset: CGFloat          // space under the text for the floating player bar
     let onWordTap: (Double) -> Void
     let onPlayerKey: (ReaderTextView.PlayerKey) -> Void
@@ -66,6 +67,7 @@ struct ReadAlongTextView: NSViewRepresentable {
         let c = context.coordinator
         c.onWordTap = onWordTap
         c.textView?.onPlayerKey = onPlayerKey
+        c.isPlaying = isPlaying
         if c.timelineID != timeline.id { c.load(timeline) }
         else if c.version != timelineVersion { c.refreshTimings(timeline) }
         c.highlight(time: currentTime)
@@ -78,11 +80,15 @@ struct ReadAlongTextView: NSViewRepresentable {
         var onWordTap: ((Double) -> Void)?
         var timelineID: UUID?
         var version = -1
+        var isPlaying = false
+        /// How long the reader gets to look around after scrolling before the view goes back to the narration.
+        static let idleBeforeFollowing: TimeInterval = 10
 
         private var ranges: [NSRange] = []       // one per word, reading order
         private var starts: [Double] = []
         private var current = -1
         private var follow = true
+        private var resumeFollow: DispatchWorkItem?
         private var scrollAnimation: Timer?
 
         static let bodyFont: NSFont = {
@@ -102,30 +108,39 @@ struct ReadAlongTextView: NSViewRepresentable {
             timelineID = t.id
             current = -1
             follow = true
+            resumeFollow?.cancel(); resumeFollow = nil
             ranges.removeAll(keepingCapacity: true)
 
-            let body = NSMutableAttributedString()
+            // One string, one attribute run: a whole book builds in milliseconds this way, where
+            // appending an attributed string per word took seconds and stalled the window.
+            let head = t.title.uppercased() + "\n"
+            var text = head
+            text.reserveCapacity(t.paragraphs.reduce(0) { $0 + $1.count * 7 })
+            var utf16 = (head as NSString).length
+            for para in t.paragraphs where !para.isEmpty {
+                for (wi, w) in para.enumerated() {
+                    let len = (w as NSString).length
+                    ranges.append(NSRange(location: utf16, length: len))
+                    text += w
+                    text += wi == para.count - 1 ? "\n" : " "
+                    utf16 += len + 1
+                }
+            }
+            text += "\n"
             let headStyle = NSMutableParagraphStyle()
             headStyle.paragraphSpacing = 22
-            body.append(NSAttributedString(string: t.title.uppercased() + "\n", attributes: [
-                .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold), .foregroundColor: NSColor.tertiaryLabelColor,
-                .kern: 1.4, .paragraphStyle: headStyle,
-            ]))
             let paraStyle = NSMutableParagraphStyle()
             paraStyle.lineHeightMultiple = 1.32
             paraStyle.paragraphSpacing = 15
-            let attrs: [NSAttributedString.Key: Any] = [.font: Self.bodyFont, .foregroundColor: Self.baseColor, .paragraphStyle: paraStyle]
-            for para in t.paragraphs where !para.isEmpty {
-                for (wi, w) in para.enumerated() {
-                    let loc = body.length
-                    body.append(NSAttributedString(string: w, attributes: attrs))
-                    ranges.append(NSRange(location: loc, length: body.length - loc))
-                    body.append(NSAttributedString(string: wi == para.count - 1 ? "\n" : " ", attributes: attrs))
-                }
-            }
-            // Room to keep the last lines up where the eye is while they're being read.
-            let tail = NSMutableParagraphStyle(); tail.paragraphSpacingBefore = 320
-            body.append(NSAttributedString(string: "\n", attributes: [.paragraphStyle: tail, .font: Self.bodyFont]))
+            let tail = NSMutableParagraphStyle(); tail.paragraphSpacingBefore = 320   // keeps the last lines up where the eye is
+            let body = NSMutableAttributedString(string: text, attributes: [
+                .font: Self.bodyFont, .foregroundColor: Self.baseColor, .paragraphStyle: paraStyle,
+            ])
+            body.setAttributes([
+                .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold), .foregroundColor: NSColor.tertiaryLabelColor,
+                .kern: 1.4, .paragraphStyle: headStyle,
+            ], range: NSRange(location: 0, length: (head as NSString).length))
+            body.addAttribute(.paragraphStyle, value: tail, range: NSRange(location: body.length - 1, length: 1))
             storage.setAttributedString(body)
             refreshTimings(t)
             scrollView?.contentView.scroll(to: .zero)
@@ -141,13 +156,26 @@ struct ReadAlongTextView: NSViewRepresentable {
             }
         }
 
-        /// Keep the column readable: centre it and cap its measure on wide windows.
+        private var insetUpdate: DispatchWorkItem?
+
+        /// Keep the column readable: centre it and cap its measure on wide windows. Changing the inset
+        /// relays out the whole text, so during a live resize it waits for the frames to settle.
         @objc func frameChanged() {
             guard let tv = textView else { return }
             let inset = max(44, (tv.bounds.width - 720) / 2)
-            if abs(tv.textContainerInset.width - inset) > 0.5 {
-                tv.textContainerInset = NSSize(width: inset, height: 40)
+            guard abs(tv.textContainerInset.width - inset) > 0.5 else { return }
+            insetUpdate?.cancel()
+            let work = DispatchWorkItem { [weak self, weak tv] in
+                guard let self, let tv else { return }
+                let inset = max(44, (tv.bounds.width - 720) / 2)
+                if abs(tv.textContainerInset.width - inset) > 0.5 {
+                    tv.textContainerInset = NSSize(width: inset, height: 40)
+                    // Layout starts over: put the spoken word back where it was.
+                    if self.current >= 0, self.follow { self.keepVisible(self.ranges[self.current], force: true) }
+                }
             }
+            insetUpdate = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + (tv.textStorage?.length ?? 0 > 200_000 ? 0.25 : 0.08), execute: work)
         }
 
         private func index(for t: Double) -> Int {   // binary search on start times
@@ -166,10 +194,14 @@ struct ReadAlongTextView: NSViewRepresentable {
             let jumped = current >= 0 && abs(i - current) > 1     // a seek / click, not the narration advancing
             storage.beginEditing()
             if current >= 0 { storage.removeAttribute(.backgroundColor, range: ranges[current]) }
+            // The spaces between words are recoloured too, which is invisible — and it makes a seek
+            // across the whole book one attribute run instead of one edit per word.
             if i > current {
-                for k in max(0, current)..<i { storage.addAttribute(.foregroundColor, value: Self.doneColor, range: ranges[k]) }
+                let from = ranges[max(0, current)].location
+                storage.addAttribute(.foregroundColor, value: Self.doneColor, range: NSRange(location: from, length: ranges[i].location - from))
             } else if i < current {
-                for k in max(0, i)...current { storage.addAttribute(.foregroundColor, value: Self.baseColor, range: ranges[k]) }
+                let from = ranges[max(0, i)].location
+                storage.addAttribute(.foregroundColor, value: Self.baseColor, range: NSRange(location: from, length: NSMaxRange(ranges[current]) - from))
             }
             if i >= 0 {
                 storage.addAttributes([.backgroundColor: Self.highlight, .foregroundColor: Self.baseColor], range: ranges[i])
@@ -177,7 +209,7 @@ struct ReadAlongTextView: NSViewRepresentable {
             storage.endEditing()
             current = i
             if i >= 0 {
-                if jumped { follow = true }
+                if jumped { follow = true; resumeFollow?.cancel(); resumeFollow = nil }
                 keepVisible(ranges[i])
             }
         }
@@ -192,26 +224,32 @@ struct ReadAlongTextView: NSViewRepresentable {
             return rect
         }
 
-        private func keepVisible(_ range: NSRange) {
-            guard let scroll = scrollView, let tv = textView, let rect = wordRect(range) else { return }
+        private var scrollTarget: CGFloat?
+
+        private func keepVisible(_ range: NSRange, force: Bool = false) {
+            guard let scroll = scrollView, let tv = textView, let rect = wordRect(range),
+                  rect.height > 0, rect.height < 400, rect.origin.y.isFinite else { return }   // not laid out yet
             let visible = scroll.contentView.bounds
-            if !follow {
-                // The reader scrolled away. Resume once the spoken word is back in view.
-                if rect.minY >= visible.minY, rect.maxY <= visible.maxY { follow = true } else { return }
-            }
+            guard follow else { return }          // the reader scrolled away; the idle timer brings us back
             let top = visible.minY + 80, bottom = visible.maxY - 150
-            if rect.minY < top || rect.maxY > bottom {
-                let target = max(0, min(rect.minY - visible.height * 0.38, tv.bounds.height - visible.height))
-                animateScroll(to: target)
-            }
+            guard force || rect.minY < top || rect.maxY > bottom else { return }
+            // While a big document is still being laid out its frame lags behind the text, so the
+            // clamp trusts the word's own position over the frame height.
+            let docHeight = max(tv.bounds.height, rect.maxY + 400)
+            let target = max(0, min(rect.minY - visible.height * 0.38, docHeight - visible.height))
+            // Already gliding to a spot that shows this word comfortably? Let it finish.
+            if let t = scrollTarget, scrollAnimation != nil, rect.minY >= t + 80, rect.maxY <= t + visible.height - 150 { return }
+            animateScroll(to: target)
         }
 
         private func animateScroll(to y: CGFloat) {
             guard let scroll = scrollView else { return }
             scrollAnimation?.invalidate()
+            scrollTarget = y
             let from = scroll.contentView.bounds.origin.y
+            if abs(from - y) < 1 { scrollTarget = nil; return }
             let start = Date()
-            let duration = 0.35
+            let duration = min(0.5, 0.25 + Double(abs(from - y)) / 4000)   // long jumps take a touch longer
             scrollAnimation = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self, weak scroll] timer in
                 Task { @MainActor in
                     guard let scroll else { timer.invalidate(); return }
@@ -222,14 +260,25 @@ struct ReadAlongTextView: NSViewRepresentable {
                     if p >= 1 {
                         timer.invalidate()
                         self?.scrollAnimation = nil
+                        self?.scrollTarget = nil
                     }
                 }
             }
         }
 
         func userScrolled() {
-            scrollAnimation?.invalidate(); scrollAnimation = nil
+            scrollAnimation?.invalidate(); scrollAnimation = nil; scrollTarget = nil
             follow = false
+            // Every scroll restarts the clock; after ten quiet seconds the narration takes over again
+            // — but only if it's playing, so a paused reader stays where you left it.
+            resumeFollow?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.follow = true
+                if self.isPlaying, self.current >= 0 { self.keepVisible(self.ranges[self.current]) }
+            }
+            resumeFollow = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.idleBeforeFollowing, execute: work)
         }
 
         @objc func liveScroll() { userScrolled() }
@@ -242,6 +291,7 @@ struct ReadAlongTextView: NSViewRepresentable {
                 if ranges[mid].location <= charIndex { ans = mid; lo = mid + 1 } else { hi = mid - 1 }
             }
             guard ans >= 0, charIndex < NSMaxRange(ranges[ans]) + 1 else { return }
+            resumeFollow?.cancel(); resumeFollow = nil
             follow = true
             onWordTap?(starts[ans])
         }

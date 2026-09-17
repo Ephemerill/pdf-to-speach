@@ -6,7 +6,7 @@ struct ReaderView: View {
 
     var body: some View {
         ReadAlongTextView(timeline: timeline, timelineVersion: timeline.version, currentTime: model.player.currentTime,
-                          bottomInset: PlayerBar.height + 24,
+                          isPlaying: model.player.isPlaying, bottomInset: PlayerBar.height + 24,
                           onWordTap: { t in model.player.seek(to: t); if !model.player.isPlaying { model.player.play() } },
                           onPlayerKey: handle)
         .overlay(alignment: .bottom) { PlayerBar(timeline: timeline) }
@@ -169,21 +169,33 @@ struct PlayerBar: View {
     }
 }
 
-/// Faint marks under the scrubber showing which parts have been generated so far.
+/// Faint marks under the scrubber showing which parts have been generated so far. Drawn in one
+/// pass — a book has thousands of chunks, far too many for a view each.
 struct ReadyTrack: View {
     let timeline: Timeline
 
     var body: some View {
         if !timeline.isComplete {
-            GeometryReader { geo in
+            let _ = timeline.version
+            Canvas { ctx, size in
                 let total = max(1, timeline.duration)
-                ForEach(timeline.chunks.filter(\.isReady), id: \.index) { c in
-                    let x = timeline.offsets[c.index] / total * geo.size.width
-                    let w = timeline.estimatedDuration(of: c) / total * geo.size.width
-                    Capsule().fill(Color.accentColor.opacity(0.35))
-                        .frame(width: max(2, w), height: 4)
-                        .offset(x: x, y: geo.size.height / 2 + 5)
+                var path = Path()
+                var runStart: Double? = nil, runEnd = 0.0
+                func flush() {
+                    guard let s = runStart else { return }
+                    let x = s / total * size.width, w = max(2, (runEnd - s) / total * size.width)
+                    path.addRoundedRect(in: CGRect(x: x, y: size.height / 2 + 3, width: w, height: 4), cornerSize: CGSize(width: 2, height: 2))
+                    runStart = nil
                 }
+                for c in timeline.chunks {          // adjacent ready chunks merge into one capsule
+                    let start = timeline.offsets[c.index], end = start + timeline.estimatedDuration(of: c)
+                    if c.isReady {
+                        if runStart == nil { runStart = start }
+                        runEnd = end
+                    } else { flush() }
+                }
+                flush()
+                ctx.fill(path, with: .color(Color.accentColor.opacity(0.35)))
             }
         }
     }
