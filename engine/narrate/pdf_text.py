@@ -3,6 +3,10 @@
 `extract` returns the text page by page (so the app can narrate any set of pages without coming
 back here) plus an outline — the PDF's own bookmarks when it has them, otherwise headings found by
 looking at font sizes and "Chapter N"-style lines — so whole chapters can be picked by name.
+
+Every block is also classified — body text, page number, running header/footer, or footnote — and
+footnote reference marks (the little raised "12" after a word) are found inside body lines, so the
+app can offer both a clean reading (the default) and a literal one without coming back here.
 """
 from __future__ import annotations
 
@@ -28,7 +32,9 @@ class Document:
     name: str
     path: str
     pages: int
-    page_blocks: list[list[str]]                # cleaned text blocks per page, in reading order
+    page_blocks: list[list[str]]                # body text blocks per page, in reading order (notes, page numbers,
+                                                #   running heads and note marks skipped)
+    page_blocks_all: list[list[str]] = field(default_factory=list)   # everything, read literally
     outline: list[Section] = field(default_factory=list)
     outline_source: str = "none"                # "bookmarks" | "headings" | "none"
 
@@ -40,7 +46,9 @@ class Document:
 _WS = re.compile(r"[ \t ]+")
 _HYPHEN_BREAK = re.compile(r"(\w)-\n(\w)")
 _LINE_BREAK = re.compile(r"(?<![.!?:;])\n(?!\n)")
-_PAGE_NUMBER = re.compile(r"^\s*(page\s*)?\d{1,4}(\s*(of|/)\s*\d{1,4})?\s*$", re.I)
+_PAGE_NUMBER = re.compile(r"^\s*[-–—(\[]?\s*(page\s*|p\.\s*)?\d{1,4}(\s*(of|/)\s*\d{1,4})?\s*[-–—)\]]?\s*$", re.I)
+# Front-matter page numbers (only trusted in the top/bottom margin: "mix" is a word too).
+_ROMAN_PAGE = re.compile(r"^\s*[-–—(\[]?\s*(?=[ivxlc]+\b)c{0,3}(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})\s*[-–—)\]]?\s*$")
 _MOSTLY_SYMBOLS = re.compile(r"[A-Za-z]")
 _SENTENCE_END = (".", "!", "?", '"', ":", ")")
 
@@ -172,6 +180,202 @@ def _heading_outline(doc: fitz.Document, progress: Callable[[str], None] | None 
     return _close_sections(entries[:300], doc.page_count)
 
 
+# ------------------------------------------------------------------ page anatomy
+#
+# Reading a scholarly PDF aloud literally means hearing "142 Journal of River Studies" at every page
+# turn, "traders twelve" in the middle of sentences and the footnotes read as if they were the text.
+# So every block is classified from its position, size and neighbours:
+#
+#   page number   a lone number (or "Page 3 of 9", "– 12 –", "xii") — roman numerals only in the margins
+#   header        a running head/foot: short, in the top/bottom margin, repeated across pages once its
+#                 digits are ignored ("142 JOURNAL…", "Downloaded from … on 12 Oct"), or rotated margin text
+#   footnote      the run of smaller-than-body blocks at the foot of the page that starts with a note
+#                 mark ("12 See…", "* Equal contribution", a raised "3"), or anything under the short
+#                 rule LaTeX/Word draw above notes. Once a document's note size is known, unmarked runs
+#                 of that size at the foot (a note continued from the previous page) count too.
+#
+# Inside body lines, note marks are small raised digits/symbols right after a word or punctuation
+# ("traders¹²,"); they're dropped from the clean text. A raised digit after a digit or a lone letter is
+# a power (10⁹, n²) and stays.
+
+_NOTE_MARK = re.compile(r"^\s*(\d{1,3}|[*∗†‡§¶#]{1,3})\s*$")
+_NOTE_START = re.compile(r"^\s*(\d{1,3}|[*∗†‡§¶]{1,3}|\(\d{1,3}\)|\[\d{1,3}\])[.)]?\s*\S")
+_NUMBERED_HEAD = re.compile(r"^\s*\d{1,4}\s|\s\d{1,4}\s*$")
+_MARGIN = 0.09          # top/bottom fraction of the page where running heads and page numbers live
+
+
+@dataclass
+class _Block:
+    text: str           # clean: note marks removed
+    full: str           # literal
+    size: float         # dominant font size
+    top: float
+    bottom: float
+    rotated: bool
+    marked: bool        # starts with a note mark (typed or raised)
+    kind: str = "body"
+
+
+def _span_join(parts: list[tuple[str, tuple]]) -> str:
+    """Spans of one line → text, adding the space PDFs often leave implicit (a gap between glyph runs)."""
+    out = ""
+    prev_x1 = None
+    for text, bbox in parts:
+        if out and prev_x1 is not None and bbox[0] - prev_x1 > 1.5 and not out.endswith(" ") and not text.startswith(" "):
+            out += " "
+        out += text
+        prev_x1 = bbox[2]
+    return out
+
+
+def _read_blocks(page: fitz.Page) -> list[_Block]:
+    d = page.get_text("dict", sort=True, flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE)
+    blocks: list[_Block] = []
+    for b in d.get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        full_lines, clean_lines = [], []
+        size_chars: Counter = Counter()
+        rotated = 0
+        marked = False
+        for li, line in enumerate(b.get("lines", [])):
+            spans = [s for s in line.get("spans", []) if s.get("text")]
+            if not spans:
+                continue
+            if abs(line.get("dir", (1, 0))[1]) > 0.1:
+                rotated += 1
+            weights: Counter = Counter()
+            for s in spans:
+                weights[round(s["size"] * 2) / 2] += len(s["text"].strip())
+            main = weights.most_common(1)[0][0] if weights else spans[0]["size"]
+            baseline = max((s["origin"][1] for s in spans if abs(s["size"] - main) < 0.6), default=spans[0]["origin"][1])
+            full, clean = [], []
+            for si, s in enumerate(spans):
+                t = s["text"]
+                full.append((t, s["bbox"]))
+                raised = (s.get("flags", 0) & 1) or (s["size"] <= main * 0.82 and s["origin"][1] < baseline - main * 0.12)
+                is_mark = bool(raised and _NOTE_MARK.match(t))
+                if is_mark:
+                    if li == 0 and si == 0:
+                        marked = True                      # a note that opens with a raised number
+                    prev = "".join(x for x, _ in clean).rstrip()
+                    # After a word or punctuation it's a note mark; after a digit or a one-letter
+                    # variable it's a power (10⁹, n²) and stays.
+                    last = prev.split()[-1] if prev else ""
+                    after_word = bool(last) and (last[-1] in ".,;:!?)\"'’”]" or (last[-1].isalpha() and len(last) >= 2))
+                    if after_word or not prev:
+                        continue                           # drop it from the clean text
+                clean.append((t, s["bbox"]))
+                size_chars[round(s["size"] * 2) / 2] += len(t.strip())
+            full_lines.append(_span_join(full))
+            clean_lines.append(_span_join(clean))
+        if not full_lines:
+            continue
+        full = _clean_block("\n".join(full_lines))
+        clean = _clean_block("\n".join(clean_lines))
+        if not full:
+            continue
+        size = size_chars.most_common(1)[0][0] if size_chars else 0.0
+        x0, y0, x1, y1 = b["bbox"]
+        blocks.append(_Block(text=clean, full=full, size=size, top=y0, bottom=y1,
+                             rotated=rotated == len(full_lines), marked=marked or bool(_NOTE_START.match(full))))
+    return blocks
+
+
+def _note_rule(page: fitz.Page) -> float | None:
+    """The y of the short horizontal rule above footnotes, if the page has one."""
+    w, h = page.rect.width, page.rect.height
+    best = None
+    try:
+        drawings = page.get_drawings()
+    except Exception:  # noqa: BLE001
+        return None
+    for dr in drawings:
+        r = dr.get("rect")
+        if r is None or r.height > 1.5 or not (25 <= r.width <= w * 0.45):
+            continue
+        if not (h * 0.4 <= r.y0 <= h * (1 - _MARGIN * 0.5)) or r.x0 > w * 0.45:
+            continue
+        if best is None or r.y0 > best:   # the lowest one: tables and figures sit higher up
+            best = r.y0
+    return best
+
+
+def _classify(pages: list[list[_Block]], rules: list[float | None], heights: list[float]) -> None:
+    """Fill in each block's kind (see the comment at the top of this section)."""
+    sizes: Counter = Counter()
+    for page in pages:
+        for b in page:
+            sizes[b.size] += len(b.full)
+    if not sizes:
+        return
+    body = sizes.most_common(1)[0][0]
+    small = body * 0.92
+
+    # Running heads: digits ignored, repeated in the margins of many pages.
+    def key(t: str) -> str:
+        return re.sub(r"\d+", "#", t.lower()).strip()
+    n = len(pages)
+    margin_counts: Counter = Counter()
+    exact_counts: Counter = Counter()
+    for page, h in zip(pages, heights):
+        seen, seen_exact = set(), set()
+        for b in page:
+            if len(b.full) < 150 and (b.bottom < h * _MARGIN * 1.4 or b.top > h * (1 - _MARGIN * 1.4)):
+                seen.add(key(b.full))
+            if len(b.full) < 120:
+                seen_exact.add(b.full)
+        margin_counts.update(seen); exact_counts.update(seen_exact)
+    repeat = max(3, n * 0.2)
+
+    for page, h in zip(pages, heights):
+        for b in page:
+            in_margin = b.bottom < h * _MARGIN * 1.4 or b.top > h * (1 - _MARGIN * 1.4)
+            if _PAGE_NUMBER.match(b.full) or (in_margin and _ROMAN_PAGE.match(b.full)):
+                b.kind = "page_number"
+            elif b.rotated and len(b.full) < 200:
+                b.kind = "header"                      # sideways margin stamps ("arXiv:… 2 Aug 2023")
+            elif in_margin and len(b.full) < 150 and n >= 3 and margin_counts[key(b.full)] >= repeat:
+                b.kind = "header"
+            elif in_margin and len(b.full) < 100 and margin_counts[key(b.full)] >= 2 and _NUMBERED_HEAD.search(b.full):
+                b.kind = "header"                      # "142 JOURNAL…" on even pages, "…TRADE 143" on odd ones
+            elif n >= 4 and len(b.full) < 120 and exact_counts[b.full] >= max(3, n * 0.4):
+                b.kind = "header"
+
+    def foot_run(page: list[_Block]) -> list[_Block]:
+        """Body blocks at the bottom of the page with nothing body-sized below them."""
+        run: list[_Block] = []
+        for b in sorted((b for b in page if b.kind == "body"), key=lambda b: b.top, reverse=True):
+            if b.size <= small:
+                run.append(b)
+            else:
+                break
+        return run[::-1]
+
+    note_sizes: Counter = Counter()
+    for page, rule, h in zip(pages, rules, heights):
+        if rule is not None:
+            below = [b for b in page if b.kind == "body" and b.top >= rule - 2 and b.size <= body * 1.02]
+            if below:
+                for b in below:
+                    b.kind = "footnote"; note_sizes[b.size] += 1
+                continue
+        run = [b for b in foot_run(page) if b.top > h * 0.45]
+        # The run counts as notes from its first marked block down.
+        for i, b in enumerate(run):
+            if b.marked:
+                for c in run[i:]:
+                    c.kind = "footnote"; note_sizes[c.size] += 1
+                break
+    # Second pass: unmarked runs set in the document's note size (a note carried over from the page before).
+    if note_sizes:
+        note = note_sizes.most_common(1)[0][0]
+        for page, h in zip(pages, heights):
+            for b in foot_run(page):
+                if b.top > h * 0.45 and abs(b.size - note) <= 0.5:
+                    b.kind = "footnote"
+
+
 # ------------------------------------------------------------------ extraction
 
 def extract(path: str, first_page: int | None = None, last_page: int | None = None,
@@ -181,20 +385,28 @@ def extract(path: str, first_page: int | None = None, last_page: int | None = No
     start = max(1, first_page or 1)
     end = min(total, last_page or total)
 
-    per_page: list[list[str]] = []
+    pages: list[list[_Block]] = []
+    rules: list[float | None] = []
+    heights: list[float] = []
     for pno in range(start - 1, end):
         if progress and (pno - start + 1) % 25 == 0:
             progress(f"Reading page {pno + 1} of {end}…")
         page = doc[pno]
-        blocks = page.get_text("blocks", sort=True)
-        cleaned = [_clean_block(b[4]) for b in blocks if b[6] == 0]  # text blocks only
-        per_page.append([c for c in cleaned if not _is_noise(c)])
+        try:
+            blocks = _read_blocks(page)
+        except Exception:  # noqa: BLE001 — a malformed page shouldn't sink the whole book
+            blocks = []
+        pages.append(blocks)
+        rules.append(_note_rule(page) if blocks else None)
+        heights.append(page.rect.height)
+    _classify(pages, rules, heights)
 
-    # Drop running headers/footers: short lines repeated on many pages.
-    if len(per_page) >= 4:
-        counts = Counter(b for page in per_page for b in set(page) if len(b) < 120)
-        repeated = {b for b, n in counts.items() if n >= max(3, len(per_page) * 0.4)}
-        per_page = [[b for b in page if b not in repeated] for page in per_page]
+    # Tables, figure axes and math soup are never worth reading; page numbers fail that test but are
+    # kept in the literal reading.
+    def keep(b: _Block, text: str) -> bool:
+        return bool(text) and (b.kind == "page_number" or not _is_noise(text))
+    clean_pages = [[b.text for b in page if b.kind == "body" and keep(b, b.text)] for page in pages]
+    full_pages = [[b.full for b in page if keep(b, b.full)] for page in pages]
 
     outline: list[Section] = []
     source = "none"
@@ -206,6 +418,8 @@ def extract(path: str, first_page: int | None = None, last_page: int | None = No
             source = "headings" if outline else "none"
     doc.close()
     # Pages outside a requested range are simply empty, so page numbers stay 1:1 with the file.
-    page_blocks = [[] for _ in range(start - 1)] + per_page + [[] for _ in range(end, total)]
-    return Document(name=os.path.basename(path), path=path, pages=total, page_blocks=page_blocks,
+    pad_before, pad_after = [[] for _ in range(start - 1)], [[] for _ in range(end, total)]
+    return Document(name=os.path.basename(path), path=path, pages=total,
+                    page_blocks=pad_before + clean_pages + pad_after,
+                    page_blocks_all=[[] for _ in range(start - 1)] + full_pages + [[] for _ in range(end, total)],
                     outline=outline, outline_source=source)

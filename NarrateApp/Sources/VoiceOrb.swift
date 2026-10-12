@@ -113,6 +113,17 @@ extension Color {
     }
 }
 
+/// "HQ" in place of the Kokoro grade when the high quality engine is speaking.
+struct HQBadge: View {
+    var body: some View {
+        Text("HQ").font(.system(size: 9.5, weight: .bold))
+            .padding(.horizontal, 4).padding(.vertical, 1)
+            .background(Color.purple.opacity(0.18), in: RoundedRectangle(cornerRadius: 3))
+            .foregroundStyle(Color.purple)
+            .help("Fish Audio S2 Pro")
+    }
+}
+
 /// The voice row on the setup screen: the chosen voice as a living orb; click for the full picker.
 struct VoiceRow: View {
     @Environment(AppModel.self) private var model
@@ -130,7 +141,7 @@ struct VoiceRow: View {
                 HStack(spacing: 6) {
                     Text(voice.name).fontWeight(.semibold)
                     Text(voice.accent == "US" ? "American" : "British").font(.caption2).foregroundStyle(.tertiary)
-                    GradeBadge(grade: voice.grade)
+                    if model.effectiveQuality == .high { HQBadge() } else { GradeBadge(grade: voice.grade) }
                 }
                 Text(voice.note).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
@@ -142,7 +153,11 @@ struct VoiceRow: View {
         .contentShape(Rectangle())
         .onTapGesture { model.showVoicePicker.toggle() }
         .popover(isPresented: $model.showVoicePicker, arrowEdge: .bottom) {
-            VoicePicker { model.showVoicePicker = false }
+            VStack(spacing: 12) {
+                QualityPicker().padding(.horizontal, 6)
+                VoicePicker(selected: model.voiceID, onChoose: { model.voiceID = $0 }) { model.showVoicePicker = false }
+            }
+            .padding(.top, 14)
         }
     }
 }
@@ -150,6 +165,8 @@ struct VoiceRow: View {
 /// The picker itself: a 4×4 grid of orbs. Hover to hear a voice, click to choose it.
 struct VoicePicker: View {
     @Environment(AppModel.self) private var model
+    let selected: String
+    let onChoose: (String) -> Void
     let dismiss: () -> Void
     @State private var hovered: String?
 
@@ -159,7 +176,7 @@ struct VoicePicker: View {
         VStack(spacing: 10) {
             LazyVGrid(columns: columns, spacing: 8) {
                 ForEach(Voice.all) { voice in
-                    let selected = voice.id == model.voiceID
+                    let selected = voice.id == self.selected
                     let playing = model.samplePlayer.playingID == voice.id
                     let loading = model.loadingSampleID == voice.id
                     VStack(spacing: 8) {
@@ -184,7 +201,7 @@ struct VoicePicker: View {
                     .background(Color.primary.opacity(hovered == voice.id ? 0.05 : 0), in: RoundedRectangle(cornerRadius: 14))
                     .contentShape(RoundedRectangle(cornerRadius: 14))
                     .onTapGesture {
-                        model.voiceID = voice.id
+                        onChoose(voice.id)
                         model.hoverPreview(nil, false)
                         Task { try? await Task.sleep(for: .milliseconds(220)); dismiss() }   // let the ring land first
                     }
@@ -197,7 +214,7 @@ struct VoicePicker: View {
                 }
             }
 
-            let shown = Voice.named(hovered ?? model.voiceID)
+            let shown = Voice.named(hovered ?? selected)
             HStack(spacing: 6) {
                 Text(shown.name).fontWeight(.semibold)
                 Text("·").foregroundStyle(.tertiary)

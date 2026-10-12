@@ -63,14 +63,23 @@ final class Engine: @unchecked Sendable {
         if process.isRunning { process.terminate() }
     }
 
+    /// An id for a request that's about to be made, so it can be cancelled by id before it has even
+    /// been sent (`call(…, id:)`).
+    func reserveID() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let id = nextID; nextID += 1
+        return id
+    }
+
     /// Send a request and wait for its result.
-    func call(_ op: String, _ args: JSON = [:], progress: Progress? = nil) async throws -> JSON {
+    func call(_ op: String, _ args: JSON = [:], id reserved: Int? = nil, progress: Progress? = nil) async throws -> JSON {
         guard isRunning else { throw Failure(message: "The narration engine isn't running.", cancelled: false) }
         var req = args
         req["op"] = op
         return try await withCheckedThrowingContinuation { cont in
             lock.lock()
-            let id = nextID; nextID += 1
+            let id: Int
+            if let reserved { id = reserved } else { id = nextID; nextID += 1 }
             req["id"] = id
             pending[id] = cont
             if let progress { self.progress[id] = progress }

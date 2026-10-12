@@ -9,14 +9,14 @@
     <key>CFBundleName</key>                       <string>Narrate</string>
     <key>CFBundleDisplayName</key>                <string>Narrate</string>
     <key>CFBundlePackageType</key>                <string>APPL</string>
-    <key>CFBundleShortVersionString</key>         <string>2.4</string>
-    <key>CFBundleVersion</key>                    <string>6</string>
+    <key>CFBundleShortVersionString</key>         <string>2.5</string>
+    <key>CFBundleVersion</key>                    <string>7</string>
     <key>CFBundleIconFile</key>                   <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>             <string>15.0</string>
     <key>LSApplicationCategoryType</key>          <string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key>            <true/>
     <key>NSPrincipalClass</key>                   <string>NSApplication</string>
-    <key>NSHumanReadableCopyright</key>           <string>Runs entirely on your Mac. Speech by Kokoro-82M.</string>
+    <key>NSHumanReadableCopyright</key>           <string>Runs entirely on your Mac. Speech by Kokoro-82M and Fish Audio S2 Pro.</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
@@ -32,6 +32,12 @@
             <key>LSItemContentTypes</key>         <array><string>public.mp3</string><string>com.apple.m4a-audio</string><string>com.microsoft.waveform-audio</string></array>
         </dict>
     </array>
+    <!-- Sparkle: updates come from the appcast on the gh-pages branch, signed with the EdDSA key in the
+         release Mac's keychain (generate_keys --account narrate). CFBundleVersion is what Sparkle compares. -->
+    <key>SUFeedURL</key>                          <string>https://ephemerill.github.io/pdf-to-speach/appcast.xml</string>
+    <key>SUPublicEDKey</key>                      <string>+dc/OkvOGwAoVjN9XCz1M7l1dojneMfxowAJLFFyYGE=</string>
+    <key>SUEnableAutomaticChecks</key>            <true/>
+    <key>SUScheduledCheckInterval</key>           <integer>86400</integer>
     <key>NSAppTransportSecurity</key>
     <dict>
         <!-- The built-in browser must load whatever site the user asks for, like a real browser. -->

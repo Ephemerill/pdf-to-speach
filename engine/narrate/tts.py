@@ -117,19 +117,19 @@ def split_sentences(paragraph: str) -> list[str]:
     return out
 
 
-def chunk_paragraph(paragraph: str) -> list[str]:
+def chunk_paragraph(paragraph: str, max_chunk: int = MAX_CHUNK) -> list[str]:
     sentences = split_sentences(paragraph)
     chunks: list[str] = []
     cur = ""
     for s in sentences:
-        if len(s) > MAX_CHUNK:                      # runaway sentence: split on clauses
+        if len(s) > max_chunk:                      # runaway sentence: split on clauses
             parts = re.split(r"(?<=[,;:])\s+", s)
             for p in parts:
-                if cur and len(cur) + len(p) + 1 > MAX_CHUNK:
+                if cur and len(cur) + len(p) + 1 > max_chunk:
                     chunks.append(cur); cur = ""
                 cur = (cur + " " + p).strip()
             continue
-        if cur and len(cur) + len(s) + 1 > MAX_CHUNK:
+        if cur and len(cur) + len(s) + 1 > max_chunk:
             chunks.append(cur); cur = ""
         cur = (cur + " " + s).strip()
     if cur:
@@ -159,6 +159,9 @@ def _espeak_config():
 
 
 class Engine:
+    """Kokoro: the standard voices. Fast (≈5× real time) with exact word timings."""
+    sample_rate = SAMPLE_RATE
+
     def __init__(self) -> None:
         self._kokoro = None
         self._lock = threading.Lock()
@@ -233,34 +236,50 @@ class Engine:
     # -- streaming narration ------------------------------------------------
 
     @staticmethod
-    def plan(paragraphs: list[str]) -> list[dict]:
+    def plan(paragraphs: list[str], max_chunk: int = MAX_CHUNK) -> list[dict]:
         """Split paragraphs into synthesis chunks. Chunks split on whitespace only, so the words of a
         paragraph's chunks, concatenated, are exactly `paragraph.split()` — the app relies on that
         to map chunk timings onto the text it already has."""
         out = []
         for pi, p in enumerate(paragraphs):
             offset = 0
-            for text in chunk_paragraph(p):
+            for text in chunk_paragraph(p, max_chunk):
                 n = len(text.split())
                 out.append({"index": len(out), "paragraph": pi, "word_offset": offset, "words": n, "text": text})
                 offset += n
         return out
 
-    def synth_chunk(self, plan: list[dict], k: int, voice_id: str, speed: float) -> tuple[np.ndarray, list[Word]]:
-        """Audio for chunk k with its leading pause baked in (so concatenating chunks in order is the
-        final narration), plus word timings relative to the chunk start."""
-        c = plan[k]
-        if k == 0:
-            pause = 0.0
-        else:
-            pause = 0.55 if plan[k - 1]["paragraph"] != c["paragraph"] else 0.18
-        audio, timed = self.synth_timed(c["text"], voice_id, speed)
-        peak = float(np.abs(audio).max()) or 1.0
-        audio = audio * min(1.0, 0.95 / peak)              # gentle peak normalisation, never clips
-        if pause:
-            audio = np.concatenate([np.zeros(int(SAMPLE_RATE * pause), np.float32), audio])
-        words = [Word(w.text, round(pause + w.start, 3), round(pause + w.end, 3)) for w in timed]
-        return audio, words
+
+
+def synth_chunks(backend, plan: list[dict], ks: list[int], voice_id: str, speed: float) -> list[tuple[np.ndarray, list[Word]]]:
+    """`synth_chunk` for several chunks; backends that batch (`synth_timed_many`) do them together."""
+    many = getattr(backend, "synth_timed_many", None)
+    if many is None or len(ks) == 1:
+        return [synth_chunk(backend, plan, k, voice_id, speed) for k in ks]
+    results = many([plan[k]["text"] for k in ks], voice_id, speed)
+    return [_finish_chunk(backend, plan, k, audio, timed) for k, (audio, timed) in zip(ks, results)]
+
+
+def synth_chunk(backend, plan: list[dict], k: int, voice_id: str, speed: float) -> tuple[np.ndarray, list[Word]]:
+    """Audio for chunk k with its leading pause baked in (so concatenating chunks in order is the
+    final narration), plus word timings relative to the chunk start. `backend` is the Kokoro
+    `Engine` or the high quality `fish.FishEngine` — anything with `sample_rate` and `synth_timed`."""
+    audio, timed = backend.synth_timed(plan[k]["text"], voice_id, speed)
+    return _finish_chunk(backend, plan, k, audio, timed)
+
+
+def _finish_chunk(backend, plan: list[dict], k: int, audio: np.ndarray, timed: list[Word]) -> tuple[np.ndarray, list[Word]]:
+    c = plan[k]
+    if k == 0:
+        pause = 0.0
+    else:
+        pause = 0.55 if plan[k - 1]["paragraph"] != c["paragraph"] else 0.18
+    peak = float(np.abs(audio).max()) or 1.0
+    audio = audio * min(1.0, 0.95 / peak)              # gentle peak normalisation, never clips
+    if pause:
+        audio = np.concatenate([np.zeros(int(backend.sample_rate * pause), np.float32), audio])
+    words = [Word(w.text, round(pause + w.start, 3), round(pause + w.end, 3)) for w in timed]
+    return audio, words
 
 
 # ------------------------------------------------------------------ encoding
@@ -276,30 +295,30 @@ def ffmpeg() -> str | None:
     return None
 
 
-def encode(audio: np.ndarray, path: str, fmt: str) -> str:
+def encode(audio: np.ndarray, path: str, fmt: str, sr: int = SAMPLE_RATE) -> str:
     """Write audio to `path` (extension chosen by fmt). Returns final path."""
     base = os.path.splitext(path)[0]
     if fmt == "wav":
         out = base + ".wav"
-        sf.write(out, audio, SAMPLE_RATE, subtype="PCM_16")
+        sf.write(out, audio, sr, subtype="PCM_16")
     elif fmt == "m4a" and ffmpeg():
         out = base + ".m4a"
-        subprocess.run([ffmpeg(), "-y", "-loglevel", "error", "-f", "f32le", "-ar", str(SAMPLE_RATE),
+        subprocess.run([ffmpeg(), "-y", "-loglevel", "error", "-f", "f32le", "-ar", str(sr),
                         "-ac", "1", "-i", "pipe:0", "-c:a", "aac", "-b:a", "112k", "-movflags", "+faststart", out],
                        input=audio.tobytes(), check=True)
     else:
         out = base + ".mp3"
         if ffmpeg():
-            subprocess.run([ffmpeg(), "-y", "-loglevel", "error", "-f", "f32le", "-ar", str(SAMPLE_RATE),
+            subprocess.run([ffmpeg(), "-y", "-loglevel", "error", "-f", "f32le", "-ar", str(sr),
                             "-ac", "1", "-i", "pipe:0", "-c:a", "libmp3lame", "-q:a", "2", out],
                            input=audio.tobytes(), check=True)
         else:
-            sf.write(out, audio, SAMPLE_RATE, format="MP3", bitrate_mode="VARIABLE", compression_level=0.25)
+            sf.write(out, audio, sr, format="MP3", bitrate_mode="VARIABLE", compression_level=0.25)
     return out
 
 
-def wav_bytes(audio: np.ndarray) -> bytes:
+def wav_bytes(audio: np.ndarray, sr: int = SAMPLE_RATE) -> bytes:
     import io
     buf = io.BytesIO()
-    sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
     return buf.getvalue()

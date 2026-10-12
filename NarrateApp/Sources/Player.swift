@@ -28,6 +28,8 @@ final class Player {
 
     /// The app hooks this up to `prioritize` on the engine.
     var onNeedChunk: ((Int) -> Void)?
+    /// Called on every clock tick (30×/s) — a pending voice switch watches for its moment here.
+    var onTick: (() -> Void)?
 
     private(set) var timeline: Timeline?
     private let queue = AVQueuePlayer()
@@ -143,6 +145,17 @@ final class Player {
 
     func skip(by delta: Double) { seek(to: currentTime + delta) }
 
+    /// The timeline's chunks were swapped for another voice's: drop the queued audio and carry on
+    /// from `time` in the new chunks, playing or paused as before.
+    func reload(at time: Double) {
+        queue.pause()
+        queue.removeAllItems(); itemChunk.removeAll(); queuedThrough = -1
+        pendingSeek = nil
+        isWaiting = false
+        seek(to: time)
+        if isPlaying, !isWaiting { queue.rate = rate }
+    }
+
     // MARK: - Queue plumbing
 
     private func makeItem(_ url: URL) -> AVPlayerItem {
@@ -199,11 +212,13 @@ final class Player {
     }
 
     private func tick() {
-        guard let t = timeline, pendingSeek == nil else { return }   // parked on a seek: keep showing its target
-        if let item = queue.currentItem, let k = itemChunk[ObjectIdentifier(item)], t.offsets.indices.contains(k) {
+        guard let t = timeline else { return }
+        if pendingSeek == nil,      // parked on a seek: keep showing its target
+           let item = queue.currentItem, let k = itemChunk[ObjectIdentifier(item)], t.offsets.indices.contains(k) {
             let secs = item.currentTime().seconds
             if secs.isFinite { currentChunk = k; within = secs }
         }
+        onTick?()
     }
 }
 

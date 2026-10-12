@@ -25,19 +25,22 @@ if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app/Contents/Developer ]
 fi
 
 ARCH="${ARCH:-$(uname -m)}"                        # arm64 | x86_64
-PY_VER="3.12.14"
+PY_VER="3.13.15"
 PY_TAG="20260901"
 PY_ARCH=$([[ "$ARCH" == "arm64" ]] && echo aarch64 || echo x86_64)
 PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PY_TAG}/cpython-${PY_VER}+${PY_TAG}-${PY_ARCH}-apple-darwin-install_only_stripped.tar.gz"
 MIN_MACOS="15.0"
+SPARKLE_VER="2.10.0"
+SPARKLE_URL="https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VER}/Sparkle-${SPARKLE_VER}.tar.xz"
 VERSION=$(plutil -extract CFBundleShortVersionString raw NarrateApp/Resources/Info.plist)
 
 APP="dist/Narrate.app"
 CONTENTS="$APP/Contents"
 RES="$CONTENTS/Resources"
 BUILD="build"
-PYDIR="$BUILD/python-$ARCH"
+PYDIR="$BUILD/python${PY_VER%.*}-$ARCH"                 # per Python minor: switching versions rebuilds cleanly
 MODCACHE="$BUILD/modulecache"
+SPARKLE="$BUILD/sparkle-$SPARKLE_VER"                 # Sparkle.framework + its bin/ tools (sign_update…)
 ENTITLEMENTS="NarrateApp/Resources/Narrate.entitlements"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
@@ -56,14 +59,41 @@ sign() {
   fi
 }
 
-# ---------------------------------------------------------------- 1. Swift binary
+# Sparkle's helpers (installer, updater UI, downloader XPC) keep their own entitlements; never give
+# them ours. Signed inside-out, then the framework itself.
+sign_sparkle() {
+  local fw="$CONTENTS/Frameworks/Sparkle.framework" v="$CONTENTS/Frameworks/Sparkle.framework/Versions/B"
+  if [[ -n "$SIGN_IDENTITY" ]]; then
+    local cs=(codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp)
+    "${cs[@]}" "$v/XPCServices/Installer.xpc"
+    "${cs[@]}" --preserve-metadata=entitlements "$v/XPCServices/Downloader.xpc"
+    "${cs[@]}" "$v/Autoupdate"
+    "${cs[@]}" "$v/Updater.app"
+    "${cs[@]}" "$fw"
+  else
+    codesign --force --deep --sign - "$fw"
+  fi
+}
+
+# ---------------------------------------------------------------- 1. Swift binary (+ Sparkle)
+if [[ ! -d "$SPARKLE/Sparkle.framework" ]]; then
+  echo "▸ Downloading Sparkle ${SPARKLE_VER}…"
+  rm -rf "$SPARKLE"; mkdir -p "$SPARKLE"
+  curl -L --progress-bar "$SPARKLE_URL" | tar -xJ -C "$SPARKLE"
+fi
 echo "▸ Compiling Swift ($ARCH)…"
-mkdir -p "$CONTENTS/MacOS"
+mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Frameworks"
 xcrun swiftc -O -parse-as-library -swift-version 5 -target "${ARCH}-apple-macos${MIN_MACOS}" \
-  -module-cache-path "$MODCACHE" \
+  -module-cache-path "$MODCACHE" -F "$SPARKLE" -framework Sparkle \
+  -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
   NarrateApp/Sources/*.swift -o "$CONTENTS/MacOS/Narrate"
+if [[ ! -d "$CONTENTS/Frameworks/Sparkle.framework" ]]; then
+  ditto "$SPARKLE/Sparkle.framework" "$CONTENTS/Frameworks/Sparkle.framework"
+  sign_sparkle >/dev/null
+fi
 
 if $swift_only && [[ -d "$RES/python" ]]; then
+  cp NarrateApp/Resources/Info.plist "$CONTENTS/Info.plist"
   sign "$CONTENTS/MacOS/Narrate" >/dev/null 2>&1 || true
   echo "✓ Swift binary updated in $APP"
   exit 0
@@ -90,15 +120,16 @@ if [[ ! -f "$PYDIR/.deps-ok" ]] || [[ engine/requirements.txt -nt "$PYDIR/.deps-
   "${RUN_PY[@]}" -m pip uninstall --quiet -y pip setuptools 2>/dev/null || true
   rm -rf "$PYDIR/lib/python${PY_VER%.*}"/{test,idlelib,tkinter,turtledemo,ensurepip,lib2to3,pydoc_data} \
          "$SP"/numpy/{_core,lib,linalg,fft,random,polynomial,ma,testing}/tests \
-         "$SP"/onnxruntime/{datasets,tools} "$SP"/pymupdf/mupdf-devel 2>/dev/null || true
+         "$SP"/onnxruntime/{datasets,tools} "$SP"/pymupdf/mupdf-devel "$SP"/mlx/include 2>/dev/null || true
   find "$PYDIR" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
   touch "$PYDIR/.deps-ok"
 fi
 
 # ---------------------------------------------------------------- 3. Assemble the bundle
 echo "▸ Assembling $APP…"
-rm -rf "$RES"
-mkdir -p "$RES"
+rm -rf "$RES" "$CONTENTS/Frameworks"
+mkdir -p "$RES" "$CONTENTS/Frameworks"
+ditto "$SPARKLE/Sparkle.framework" "$CONTENTS/Frameworks/Sparkle.framework"
 cp NarrateApp/Resources/Info.plist "$CONTENTS/Info.plist"
 echo -n "APPL????" > "$CONTENTS/PkgInfo"
 rsync -a --exclude "__pycache__" engine/ "$RES/engine/"
@@ -120,11 +151,13 @@ if [[ -n "$SIGN_IDENTITY" ]]; then
     | while IFS= read -r -d '' f; do
         if file -b "$f" | grep -q "Mach-O"; then sign "$f" >/dev/null 2>&1 || true; fi
       done
+  sign_sparkle >/dev/null
   sign "$CONTENTS/MacOS/Narrate" >/dev/null
   sign "$APP" >/dev/null
   codesign --verify --deep --strict "$APP"
 else
   echo "▸ Signing (ad hoc — set SIGN_IDENTITY for a distributable build)…"
+  sign_sparkle >/dev/null 2>&1
   codesign --force --deep --sign - "$APP" >/dev/null 2>&1
 fi
 xattr -cr "$APP" 2>/dev/null || true

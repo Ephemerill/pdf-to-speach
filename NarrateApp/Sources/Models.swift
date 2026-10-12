@@ -32,6 +32,16 @@ struct Voice: Identifiable, Hashable {
     static func named(_ id: String) -> Voice { all.first { $0.id == id } ?? all[0] }
 }
 
+/// Which engine speaks. Every voice exists in both: high quality is Fish Audio S2 Pro cloning the
+/// Kokoro voice, with S2's far more natural delivery (see engine/narrate/fish.py).
+enum Quality: String, CaseIterable, Identifiable, Codable {
+    case standard, high
+    var id: String { rawValue }
+    var label: String { self == .high ? "High Quality" : "Standard" }
+    /// Appended to a voice name where both qualities could be meant ("Heart HQ").
+    var suffix: String { self == .high ? " HQ" : "" }
+}
+
 // MARK: - Source document
 
 /// A chapter (or any bookmark/heading) of a PDF and the pages it spans.
@@ -52,10 +62,22 @@ struct SourceDocument: Equatable {
 
     /// Pasted / captured text, already in paragraphs.
     private var text: [String] = []
-    /// PDFs: cleaned text blocks per page (index 0 = page 1). Everything the file has, so any set of
-    /// pages can be narrated without going back to the engine.
-    private(set) var pageBlocks: [[String]] = []
-    private var pageWords: [Int] = []
+    /// PDFs: text blocks per page (index 0 = page 1), in two readings — clean (no page numbers,
+    /// running heads, footnotes or note marks) and literal. Everything the file has, so any set of
+    /// pages can be narrated either way without going back to the engine.
+    private var cleanBlocks: [[String]] = []
+    private var allBlocks: [[String]] = []
+    private var cleanWords: [Int] = []
+    private var allWords: [Int] = []
+    /// Skip page numbers, running heads and footnotes (the "Skip page numbers & footnotes" option).
+    var skipsNotes = true
+    var pageBlocks: [[String]] { skipsNotes ? cleanBlocks : allBlocks }
+    private var pageWords: [Int] { skipsNotes ? cleanWords : allWords }
+    /// How many words the clean reading leaves out of the selected pages.
+    var skippedWords: Int {
+        guard isPDF else { return 0 }
+        return selection.reduce(0) { $0 + (allWords.indices.contains($1 - 1) ? allWords[$1 - 1] - cleanWords[$1 - 1] : 0) }
+    }
     var outline: [OutlineEntry] = []
     var outlineSource = "none"
     /// PDFs: the 1-based page numbers that will be narrated. Everything else in the file is ignored —
@@ -67,10 +89,13 @@ struct SourceDocument: Equatable {
         text = paragraphs
     }
 
-    init(pdfName name: String, path: String, pageBlocks: [[String]], outline: [OutlineEntry], outlineSource: String) {
+    init(pdfName name: String, path: String, pageBlocks: [[String]], allBlocks: [[String]]?,
+         outline: [OutlineEntry], outlineSource: String) {
         self.name = name; self.path = path; self.pages = pageBlocks.count
-        self.pageBlocks = pageBlocks
-        pageWords = pageBlocks.map { $0.reduce(0) { $0 + $1.split(separator: " ").count } }
+        cleanBlocks = pageBlocks
+        self.allBlocks = allBlocks?.count == pageBlocks.count ? allBlocks! : pageBlocks
+        let count = { (b: [[String]]) in b.map { $0.reduce(0) { $0 + $1.split(separator: " ").count } } }
+        cleanWords = count(cleanBlocks); allWords = count(self.allBlocks)
         self.outline = outline; self.outlineSource = outlineSource
         selection = IndexSet(1...max(1, pages))
     }
@@ -197,6 +222,9 @@ struct Narration: Codable, Equatable, Identifiable {
     var voice: String
     var duration: Double
     var paragraphs: [[TimedWord]]
+    /// Added in 2.5; absent from older sidecars (then derived from the voice name).
+    var voiceID: String? = nil
+    var quality: Quality? = nil
 
     var id: String { path }
     var url: URL { URL(fileURLWithPath: path) }
@@ -251,7 +279,11 @@ final class Timeline {
 
     let id = UUID()
     let title: String
-    let voice: String
+    /// The voice speaking right now. A voice switched mid-book replaces the chunks (`adopt`) but
+    /// keeps the timeline — and so the reader's text, scroll position and identity.
+    private(set) var voiceID: String
+    private(set) var quality: Quality
+    var voice: String { Voice.named(voiceID).name + quality.suffix }
     let paragraphs: [[String]]       // words per paragraph (whitespace-split, same as the engine's)
     private(set) var chunks: [Chunk]
     /// Bumped whenever timings change so views can resync cheaply.
@@ -260,8 +292,9 @@ final class Timeline {
     private(set) var duration: Double = 0
     private var secondsPerWord: Double
 
-    init(title: String, voice: String, paragraphs: [[String]], chunks: [Chunk], speed: Double) {
-        self.title = title; self.voice = voice; self.paragraphs = paragraphs; self.chunks = chunks
+    init(title: String, voiceID: String, quality: Quality, paragraphs: [[String]], chunks: [Chunk], speed: Double) {
+        self.title = title; self.voiceID = voiceID; self.quality = quality
+        self.paragraphs = paragraphs; self.chunks = chunks
         secondsPerWord = 0.36 / speed
         relayout()
     }
@@ -272,10 +305,46 @@ final class Timeline {
         var chunk = Chunk(index: 0, paragraph: 0, wordOffset: 0, wordCount: paras.reduce(0) { $0 + $1.count })
         chunk.url = n.url; chunk.duration = n.duration
         chunk.words = n.paragraphs.flatMap { $0.map { (start: $0.start, end: $0.end) } }
-        self.init(title: n.title, voice: n.voice, paragraphs: paras, chunks: [chunk], speed: 1)
+        let id = n.voiceID ?? Voice.all.first { n.voice.hasPrefix($0.name) }?.id ?? Voice.all[0].id
+        self.init(title: n.title, voiceID: id, quality: n.quality ?? .standard, paragraphs: paras, chunks: [chunk], speed: 1)
         singleFile = true
     }
     private(set) var singleFile = false
+
+    /// Switch to another voice's chunks (from a second narration of the same paragraphs).
+    func adopt(voiceID: String, quality: Quality, chunks: [Chunk]) {
+        self.voiceID = voiceID; self.quality = quality
+        self.chunks = chunks
+        singleFile = false
+        let known = chunks.filter(\.isReady)
+        let w = known.reduce(0) { $0 + $1.wordCount }
+        if w > 20 { secondsPerWord = known.reduce(0) { $0 + ($1.duration ?? 0) } / Double(w) }
+        relayout()
+    }
+
+    /// The chunk (in `chunks`) holding a word, by its position in reading order.
+    static func chunk(containingWord g: Int, in chunks: [Chunk]) -> Int {
+        var n = 0
+        for c in chunks {
+            if g < n + c.wordCount { return c.index }
+            n += c.wordCount
+        }
+        return max(0, chunks.count - 1)
+    }
+
+    /// The word being spoken at `time`, by its position in reading order.
+    func wordIndex(at time: Double) -> Int {
+        let starts = wordStarts()
+        var lo = 0, hi = starts.count - 1, ans = 0
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if starts[mid] <= time { ans = mid; lo = mid + 1 } else { hi = mid - 1 }
+        }
+        return ans
+    }
+
+    /// Every word in reading order, flattened.
+    var words: [String] { paragraphs.flatMap { $0 } }
 
     var readyCount: Int { chunks.filter(\.isReady).count }
     var isComplete: Bool { readyCount == chunks.count }

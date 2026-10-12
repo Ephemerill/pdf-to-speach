@@ -16,9 +16,11 @@ final class AppModel {
         var id: String { rawValue }
     }
 
+    /// The standard voices' readiness. Documents can be opened and set up in every state but
+    /// `.failed` (the engine reads PDFs without any model); only generating waits for `.ready`.
     enum Status: Equatable {
         case starting
-        case downloading(String, Double)
+        case downloading            // first launch: the Kokoro voices are coming down in the background (see `kokoro`)
         case loading
         case ready
         case failed(String)
@@ -61,6 +63,15 @@ final class AppModel {
     var format = UserDefaults.standard.string(forKey: "format") ?? "mp3" {
         didSet { UserDefaults.standard.set(format, forKey: "format") }
     }
+    /// Standard (Kokoro) or high quality (Fish Audio S2 Pro). Use `setQuality` — picking High is what
+    /// starts the model download.
+    private(set) var quality = Quality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .standard {
+        didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
+    }
+    /// PDFs: leave out page numbers, running heads and footnotes (and the note marks in the text).
+    var skipNotes = UserDefaults.standard.object(forKey: "skipNotes") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(skipNotes, forKey: "skipNotes"); document?.skipsNotes = skipNotes }
+    }
 
     // Work in flight
     var isGenerating = false
@@ -80,11 +91,18 @@ final class AppModel {
     /// Opens one of the app's `Window` scenes by id; the root view hands this in (it lives in the SwiftUI environment).
     var openWindow: (String) -> Void = { _ in }
 
-    let engine = Engine()
+    /// Replaced by a fresh one on "Try Again" (a Process can only be launched once).
+    private(set) var engine = Engine()
     let player = Player()
     let samplePlayer = SamplePlayer()
     let browser = BrowserController()
     let updater = Updater()
+    let kokoro = ModelPack.kokoro(in: AppModel.modelDir)
+    let hq = ModelPack.fish(in: AppModel.modelDir.appendingPathComponent("fish-s2-pro"))
+    /// The engine process is up: PDFs can be read even while the voices are still downloading.
+    private(set) var engineUp = false
+    /// Generate was pressed before the voices were ready: start as soon as they are.
+    var generateWhenReady = false
     /// Voice previews live on disk (Application Support/Narrate/samples/<key>/), rendered once per voice
     /// in the background right after the engine comes up, so pressing play is instant from then on.
     private var sampleKey = "default"
@@ -119,32 +137,26 @@ final class AppModel {
     func start() {
         guard !started else { return }
         started = true
-        updater.onMessage = { [weak self] text, isError in self?.showToast(text, isError: isError) }
+        hq.onReady = { [weak self] in self?.hqBecameReady() }
+        // High quality was chosen before but isn't all here yet: carry on downloading in the background.
+        if quality == .high, !hq.isReady { hq.download() }
         browser.onDownloadedPDF = { [weak self] file in
             self?.showToast("Saved the PDF to Downloads.", isError: false)
             self?.openPDF(file)
         }
-        updater.checkAutomatically()
         Task { await bootstrap() }
     }
 
+    /// The engine starts straight away — it reads PDFs without any model — and the voices download
+    /// in the background meanwhile on first launch. Only generating has to wait for them.
     private func bootstrap() async {
         log.info("bootstrap: python=\(Self.pythonURL.path, privacy: .public) engine=\(Self.engineScriptURL.path, privacy: .public)")
         do {
-            if !ModelDownloader.isReady(in: Self.modelDir) {
-                log.info("bootstrap: downloading model")
-                status = .downloading("Downloading voice model…", 0)
-                try await ModelDownloader().download(to: Self.modelDir) { label, frac in
-                    Task { @MainActor in self.status = .downloading(label, frac) }
-                }
-            }
-            status = .loading
             engine.onExit = { [weak self] code in
                 Task { @MainActor in
-                    guard let self else { return }
-                    if self.status == .ready || self.status == .loading {
-                        self.status = .failed("The narration engine stopped (exit \(code)). See engine.log in Application Support.")
-                    }
+                    guard let self, self.engineUp else { return }
+                    self.engineUp = false
+                    self.status = .failed("The narration engine stopped (exit \(code)). See engine.log in Application Support.")
                 }
             }
             try engine.start(python: Self.pythonURL, script: Self.engineScriptURL, modelDir: Self.modelDir,
@@ -154,14 +166,33 @@ final class AppModel {
             ffmpegAvailable = hello["ffmpeg"] as? Bool ?? false
             if !formats.contains(format) { format = "mp3" }
             if let key = hello["sample_key"] as? String { sampleKey = key }
+            engineUp = true
+            let queued = pendingOpen; pendingOpen = []
+            if !queued.isEmpty { open(queued) }
+            if kokoro.isReady {
+                await loadVoices()
+            } else {
+                log.info("bootstrap: downloading the voices in the background")
+                status = .downloading
+                kokoro.onReady = { [weak self] in Task { await self?.loadVoices() } }
+                kokoro.download()
+            }
+        } catch {
+            log.error("bootstrap failed: \(error.localizedDescription, privacy: .public)")
+            status = .failed(error.localizedDescription)
+        }
+    }
+
+    private func loadVoices() async {
+        do {
+            status = .loading
             _ = try await engine.call("warm_up")
             log.info("bootstrap: engine ready")
             status = .ready
-            let queued = pendingOpen; pendingOpen = []
-            if !queued.isEmpty { open(queued) }
             prewarmSamples()
+            if generateWhenReady { generateWhenReady = false; generate() }
         } catch {
-            log.error("bootstrap failed: \(error.localizedDescription, privacy: .public)")
+            log.error("warm_up failed: \(error.localizedDescription, privacy: .public)")
             status = .failed(error.localizedDescription)
         }
     }
@@ -169,7 +200,10 @@ final class AppModel {
     func retrySetup() {
         prewarmTask?.cancel(); prewarmTask = nil
         sampleJobs.removeAll()
+        engineUp = false
+        engine.onExit = nil
         engine.stop()
+        engine = Engine()
         status = .starting
         started = false
         start()
@@ -180,7 +214,7 @@ final class AppModel {
     func open(_ urls: [URL]) {
         log.info("open: \(urls.map(\.lastPathComponent).joined(separator: ", "), privacy: .public) status=\(String(describing: self.status), privacy: .public)")
         // Files opened from Finder before the engine is up (e.g. double-clicking a PDF at launch): wait for it.
-        if !status.isReady, urls.contains(where: { $0.pathExtension.lowercased() == "pdf" }) {
+        if !engineUp, urls.contains(where: { $0.pathExtension.lowercased() == "pdf" }) {
             pendingOpen = urls
             return
         }
@@ -234,7 +268,7 @@ final class AppModel {
                     if let label = p["label"] as? String { Task { @MainActor in self.extractLabel = label } }
                 }
                 let blocks = r["page_blocks"] as? [[String]] ?? []
-                guard blocks.contains(where: { !$0.isEmpty }) else {
+                guard blocks.contains(where: { !$0.isEmpty }) || (r["page_blocks_all"] as? [[String]] ?? []).contains(where: { !$0.isEmpty }) else {
                     showToast("No readable text found. This PDF looks like scanned images.", isError: true); return
                 }
                 let outline = (r["outline"] as? [[String: Any]] ?? []).enumerated().map { i, e in
@@ -242,7 +276,7 @@ final class AppModel {
                                  first: e["first"] as? Int ?? 1, last: e["last"] as? Int ?? 1)
                 }
                 setDocument(SourceDocument(pdfName: r["name"] as? String ?? url.lastPathComponent, path: url.path,
-                                           pageBlocks: blocks, outline: outline,
+                                           pageBlocks: blocks, allBlocks: r["page_blocks_all"] as? [[String]], outline: outline,
                                            outlineSource: r["outline_source"] as? String ?? "none"))
                 if !outline.isEmpty, blocks.count > 30 {
                     showToast("Found \(outline.count) chapters — tick the ones you want, or choose pages.", isError: false)
@@ -265,6 +299,8 @@ final class AppModel {
     }
 
     private func setDocument(_ doc: SourceDocument) {
+        var doc = doc
+        doc.skipsNotes = skipNotes
         document = doc
         rangesText = doc.isPDF ? doc.rangesText : ""
     }
@@ -313,6 +349,7 @@ final class AppModel {
         do {
             let n = try Narration.load(sidecar: sidecar)
             narration = n
+            script = nil
             try openReader(Timeline(narration: n))
             showToast("Reopened an audiobook Narrate made earlier. Drop a PDF to make a new one.", isError: false)
         } catch {
@@ -402,18 +439,25 @@ final class AppModel {
     // MARK: - Voices
 
     private var sampleDir: URL { Self.supportDir.appendingPathComponent("samples/\(sampleKey)") }
-    private func sampleFile(_ id: String) -> URL { sampleDir.appendingPathComponent("\(id).wav") }
+    private func sampleName(_ id: String, _ q: Quality) -> String { q == .high ? "hq-\(id)" : id }
+    private func sampleFile(_ id: String, _ q: Quality) -> URL { sampleDir.appendingPathComponent("\(sampleName(id, q)).wav") }
+    func hasSample(_ id: String, _ q: Quality) -> Bool { cachedSampleIDs.contains(sampleName(id, q)) }
 
-    /// Preview a voice at the current speed. Instant when the sample is cached; otherwise it's rendered
-    /// now (and kept), jumping the queue ahead of the background pre-render.
+    /// Preview a voice at the current speed, in the quality that would be used. Instant when the
+    /// sample is cached; otherwise it's rendered now (and kept), jumping the queue ahead of the
+    /// background pre-render.
     func sampleVoice(_ id: String) {
         if samplePlayer.playingID == id { samplePlayer.stop(); return }
-        guard status.isReady else { showToast("The voice model is still loading.", isError: true); return }
+        guard status.isReady else {
+            showToast(status == .downloading ? "The voices are still downloading — \(Int(kokoro.fraction * 100))% so far." : "The voices are still loading.", isError: true)
+            return
+        }
+        let q = effectiveQuality
         Task {
             do {
-                if !cachedSampleIDs.contains(id) { loadingSampleID = id }
+                if !hasSample(id, q) { loadingSampleID = id }
                 defer { if loadingSampleID == id { loadingSampleID = nil } }
-                let url = try await ensureSample(id)
+                let url = try await ensureSample(id, q)
                 try samplePlayer.play(url: url, id: id, rate: speed)
             } catch is CancellationError {
             } catch {
@@ -425,7 +469,9 @@ final class AppModel {
     private var hoverTask: Task<Void, Never>?
 
     /// Hovering an orb plays its sample after a beat (so sweeping across the grid doesn't fire them
-    /// all); leaving it stops. Pass nil to cancel everything.
+    /// all); leaving it stops. Pass nil to cancel everything. A high quality sample takes a while to
+    /// render the first time, so until it's cached the standard one plays and the high quality one
+    /// is rendered in the background for next time.
     func hoverPreview(_ id: String?, _ inside: Bool) {
         hoverTask?.cancel(); hoverTask = nil
         guard let id, inside else {
@@ -436,18 +482,29 @@ final class AppModel {
         hoverTask = Task {
             try? await Task.sleep(for: .milliseconds(180))
             guard !Task.isCancelled, status.isReady else { return }
+            var q = effectiveQuality
+            if q == .high, !hasSample(id, .high) {
+                if !isGenerating { renderInBackground(id, .high) }
+                q = .standard
+            }
             do {
-                if !cachedSampleIDs.contains(id) { loadingSampleID = id }
+                if !hasSample(id, q) { loadingSampleID = id }
                 defer { if loadingSampleID == id { loadingSampleID = nil } }
-                let url = try await ensureSample(id)
+                let url = try await ensureSample(id, q)
                 guard !Task.isCancelled else { return }
                 try samplePlayer.play(url: url, id: id, rate: speed)
             } catch {}
         }
     }
 
-    /// Render every voice's sample that isn't on disk yet, selected voice first, one at a time and only
-    /// while nothing else needs the engine. Also drops caches left by older sample scripts.
+    private func renderInBackground(_ id: String, _ q: Quality) {
+        guard sampleJobs[sampleName(id, q)] == nil, !hasSample(id, q) else { return }
+        Task { _ = try? await ensureSample(id, q) }
+    }
+
+    /// Render every voice's standard sample that isn't on disk yet (plus the chosen voice's high
+    /// quality one when that's in use), selected voice first, one at a time and only while nothing
+    /// else needs the engine. Also drops caches left by older sample scripts.
     private func prewarmSamples() {
         prewarmTask?.cancel()
         let fm = FileManager.default
@@ -455,81 +512,165 @@ final class AppModel {
         if let dirs = try? fm.contentsOfDirectory(at: sampleDir.deletingLastPathComponent(), includingPropertiesForKeys: nil) {
             for d in dirs where d.lastPathComponent != sampleKey { try? fm.removeItem(at: d) }
         }
-        cachedSampleIDs = Set(Voice.all.map(\.id).filter { fm.fileExists(atPath: sampleFile($0).path) })
-        let order = [voiceID] + Voice.all.map(\.id).filter { $0 != voiceID }
+        let names = (try? fm.contentsOfDirectory(atPath: sampleDir.path)) ?? []
+        cachedSampleIDs = Set(names.filter { $0.hasSuffix(".wav") }.map { ($0 as NSString).deletingPathExtension })
+        var order: [(String, Quality)] = ([voiceID] + Voice.all.map(\.id).filter { $0 != voiceID }).map { ($0, .standard) }
+        if effectiveQuality == .high { order.insert((voiceID, .high), at: 1) }
         prewarmTask = Task {
-            for id in order where !cachedSampleIDs.contains(id) {
+            for (id, q) in order where !hasSample(id, q) {
                 while isGenerating || isCapturing {                 // don't compete with real work
                     try? await Task.sleep(for: .seconds(1))
                     if Task.isCancelled { return }
                 }
                 if Task.isCancelled || !status.isReady { return }
-                _ = try? await ensureSample(id)
+                _ = try? await ensureSample(id, q)
             }
-            log.info("samples: all \(self.cachedSampleIDs.count) voice previews cached")
+            log.info("samples: \(self.cachedSampleIDs.count) voice previews cached")
         }
     }
 
     /// The on-disk sample for a voice, rendering it if needed. Concurrent callers share one render.
-    private func ensureSample(_ id: String) async throws -> URL {
-        let file = sampleFile(id)
-        if FileManager.default.fileExists(atPath: file.path) { cachedSampleIDs.insert(id); return file }
-        if let job = sampleJobs[id] { return try await job.value }
+    private func ensureSample(_ id: String, _ q: Quality) async throws -> URL {
+        let file = sampleFile(id, q), name = sampleName(id, q)
+        if FileManager.default.fileExists(atPath: file.path) { cachedSampleIDs.insert(name); return file }
+        if let job = sampleJobs[name] { return try await job.value }
         let job = Task<URL, Error> {
-            defer { sampleJobs[id] = nil }
+            defer { sampleJobs[name] = nil }
             // Write to a temp name and rename, so a half-written file is never mistaken for a sample.
             let tmp = file.appendingPathExtension("part")
-            _ = try await engine.call("sample", ["voice": id, "speed": 1.0, "out": tmp.path])
+            _ = try await engine.call("sample", ["voice": id, "speed": 1.0, "out": tmp.path, "quality": q.rawValue])
             try? FileManager.default.removeItem(at: file)
             try FileManager.default.moveItem(at: tmp, to: file)
-            cachedSampleIDs.insert(id)
+            cachedSampleIDs.insert(name)
             return file
         }
-        sampleJobs[id] = job
+        sampleJobs[name] = job
         return try await job.value
+    }
+
+    // MARK: - High quality voices
+
+    /// High quality only once its model is on disk; until then (or while it downloads) Standard is used.
+    var effectiveQuality: Quality { quality == .high && hq.isReady ? .high : .standard }
+
+    /// Picking High Quality is what downloads the model — in the background, nothing waits on it.
+    func setQuality(_ q: Quality) {
+        quality = q
+        if q == .high {
+            if !hq.isReady { hq.download() } else { prewarmSamples() }
+        } else if !(isGenerating && job?.quality == .high) {
+            engine.send("hq_unload")                          // hand the ~7 GB of memory back
+        }
+    }
+
+    private func hqBecameReady() {
+        showToast("High quality voices are ready" + (showReader ? " — choose one from the voice menu." : "."), isError: false)
+        if quality == .high { prewarmSamples() }
+    }
+
+    /// Free the disk space again. Anything narrated with them stays.
+    func deleteHQModel() {
+        if isGenerating, job?.quality == .high {
+            showToast("Wait for the high quality narration to finish (or cancel it) first.", isError: true); return
+        }
+        engine.send("hq_unload")
+        hq.delete()
+        let fm = FileManager.default
+        try? fm.removeItem(at: Self.supportDir.appendingPathComponent("fish-references"))
+        for name in cachedSampleIDs where name.hasPrefix("hq-") {
+            try? fm.removeItem(at: sampleDir.appendingPathComponent("\(name).wav"))
+        }
+        cachedSampleIDs = cachedSampleIDs.filter { !$0.hasPrefix("hq-") }
+        quality = .standard
+        showToast("Deleted the high quality voices.", isError: false)
     }
 
     // MARK: - Generation
 
     var canGenerate: Bool { status.isReady && document != nil && !isGenerating && !isExtracting }
+    /// The voices are still coming: Generate can be pressed anyway and starts once they're in.
+    var canQueueGeneration: Bool { (status == .downloading || status == .loading || status == .starting) && document != nil && !isExtracting }
+
+    /// What's being narrated — kept so a voice switch can narrate the same thing again.
+    private struct Script {
+        let title: String
+        let paragraphs: [String]
+        let folder: String
+        let stem: String
+        let speed: Double
+    }
+    /// One engine `narrate` request: a voice reading the script.
+    private struct Job {
+        let id = UUID()
+        let engineID: Int
+        let voiceID: String
+        let quality: Quality
+    }
+    /// A voice switch in progress. The new voice's chunks collect here while the old voice keeps
+    /// talking; once the chunk the listener is in exists, the swap is armed for the next natural
+    /// break (`armedWord`) and happens on the player's clock, mid-sentence, without a gap.
+    private struct VoiceSwitch {
+        let job: UUID
+        var chunks: [Timeline.Chunk]
+        var armedWord: Int? = nil
+        var armedTime = 0.0          // when that word starts in the old voice
+    }
+
+    private var script: Script?
+    private var job: Job?
+    private var voiceSwitch: VoiceSwitch?
+    /// "Bella HQ" while a switch to it is being prepared (the reader says so).
+    var switchingTo: String? {
+        guard voiceSwitch != nil, let j = job else { return nil }
+        return Voice.named(j.voiceID).name + j.quality.suffix
+    }
 
     func generate() {
+        if canQueueGeneration { generateWhenReady.toggle(); return }
         guard canGenerate, let doc = document else { return }
         if doc.isPDF, doc.selection.isEmpty { showToast("Choose at least one page or chapter first.", isError: true); return }
-        isGenerating = true
-        progress = GenerationProgress(label: "Warming up…")
-        let voice = Voice.named(voiceID)
         let folder = doc.path.map { ($0 as NSString).deletingLastPathComponent }
             ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0].path
         var stem = (doc.isPDF ? (doc.name as NSString).deletingPathExtension : doc.name)
             .replacing(regex: #"[\\/:*?"<>|]+"#, with: " ").trimmingCharacters(in: .whitespaces)
         stem = String(stem.prefix(80))
         if stem.isEmpty { stem = "Narration" }
-        let title = doc.isPDF ? (doc.name as NSString).deletingPathExtension : doc.name
-        let outBase = (folder as NSString).appendingPathComponent("\(stem) – \(voice.name)")
         // Same whitespace normalisation as the engine, so word counts line up chunk for chunk.
         let paragraphs = doc.paragraphs
             .map { $0.replacing(regex: #"\s+"#, with: " ").trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("narrate-\(UUID().uuidString)")
+        script = Script(title: doc.isPDF ? (doc.name as NSString).deletingPathExtension : doc.name,
+                        paragraphs: paragraphs, folder: folder, stem: stem, speed: speed)
         cleanupChunks()
-        chunkDir = dir
-        let t0 = Date()
-        let speed = self.speed
+        chunkDir = FileManager.default.temporaryDirectory.appendingPathComponent("narrate-\(UUID().uuidString)")
+        progress = GenerationProgress(label: "Warming up…")
+        startJob(voiceID: voiceID, quality: effectiveQuality, startWord: 0, switching: false)
+    }
 
+    private func startJob(voiceID: String, quality: Quality, startWord: Int, switching: Bool) {
+        guard let s = script, let root = chunkDir else { return }
+        let rid = engine.reserveID()
+        let j = Job(engineID: rid, voiceID: voiceID, quality: quality)
+        job = j
+        isGenerating = true
+        let voice = Voice.named(voiceID)
+        let label = voice.name + quality.suffix
+        let outBase = (s.folder as NSString).appendingPathComponent("\(s.stem) – \(label)")
+        // Each job its own folder: the old voice's files keep playing while the new one writes.
+        let dir = root.appendingPathComponent(String(j.id.uuidString.prefix(8)))
+        let t0 = Date()
         Task {
-            defer {
-                isGenerating = false
-                if !showReader { cleanupChunks() }     // reader was closed mid-way; the engine has stopped now
-            }
             do {
                 let r = try await engine.call("narrate", [
-                    "paragraphs": paragraphs, "voice": voice.id, "speed": speed, "fmt": format,
-                    "out_base": outBase, "chunk_dir": dir.path,
-                ]) { p in
-                    Task { @MainActor in self.handleGenerationEvent(p, title: title, voice: voice.name,
-                                                                     paragraphs: paragraphs, speed: speed, startedAt: t0) }
+                    "paragraphs": s.paragraphs, "voice": voice.id, "speed": s.speed, "fmt": format,
+                    "out_base": outBase, "chunk_dir": dir.path, "quality": quality.rawValue, "start_word": startWord,
+                ], id: rid) { p in
+                    Task { @MainActor in self.handleGenerationEvent(p, job: j, switching: switching, startedAt: t0) }
                 }
+                guard job?.id == j.id else { return }       // superseded by another voice switch
+                if voiceSwitch?.job == j.id { performSwitch(at: voiceSwitch?.armedWord ?? currentWord()) }
+                job = nil
+                isGenerating = false
                 let words = (r["paragraphs"] as? [[[Any]]] ?? []).map { p in
                     p.compactMap { w -> TimedWord? in
                         guard w.count == 3, let t = w[0] as? String, let s = w[1] as? Double, let e = w[2] as? Double else { return nil }
@@ -537,37 +678,59 @@ final class AppModel {
                     }
                 }
                 let path = r["path"] as? String ?? outBase
-                let n = Narration(path: path, name: (path as NSString).lastPathComponent, title: title,
-                                  voice: voice.name, duration: r["duration"] as? Double ?? 0, paragraphs: words)
+                let n = Narration(path: path, name: (path as NSString).lastPathComponent, title: s.title,
+                                  voice: label, duration: r["duration"] as? Double ?? 0, paragraphs: words,
+                                  voiceID: voice.id, quality: quality)
                 try? n.writeSidecar()
                 narration = n
-                if !showReader { try openReader(Timeline(narration: n)) }
+                if !showReader { try openReader(Timeline(narration: n)); cleanupChunks() }
                 showToast("Saved \(n.name) — AirDrop it to your phone from the toolbar.", isError: false)
-            } catch let e as Engine.Failure where e.cancelled {
-                showToast("Cancelled", isError: false)
             } catch {
-                showToast("Generation failed: \(error.localizedDescription)", isError: true)
+                guard job?.id == j.id else { return }       // a cancelled, superseded job: nothing to say
+                job = nil
+                isGenerating = false
+                if voiceSwitch?.job == j.id { voiceSwitch = nil }
+                if !showReader { cleanupChunks() }          // reader was closed mid-way; the engine has stopped now
+                if let e = error as? Engine.Failure, e.cancelled {
+                    showToast("Cancelled", isError: false)
+                } else {
+                    showToast((switching ? "Couldn't switch voices: " : "Generation failed: ") + error.localizedDescription, isError: true)
+                }
             }
         }
     }
 
-    private func handleGenerationEvent(_ p: Engine.JSON, title: String, voice: String, paragraphs: [String],
-                                       speed: Double, startedAt: Date) {
+    private func handleGenerationEvent(_ p: Engine.JSON, job j: Job, switching: Bool, startedAt: Date) {
+        guard job?.id == j.id else { return }               // a job that's been replaced
         switch p["event"] as? String {
         case "plan":
             let chunks = (p["chunks"] as? [[String: Any]] ?? []).map {
                 Timeline.Chunk(index: $0["index"] as? Int ?? 0, paragraph: $0["paragraph"] as? Int ?? 0,
                                wordOffset: $0["word_offset"] as? Int ?? 0, wordCount: $0["words"] as? Int ?? 0)
             }
-            let t = Timeline(title: title, voice: voice, paragraphs: paragraphs.map { $0.components(separatedBy: " ") },
-                             chunks: chunks, speed: speed)
             progress = GenerationProgress(label: nil, done: 0, total: chunks.count)
-            try? openReader(t)
+            if switching, let t = timeline {
+                voiceSwitch = VoiceSwitch(job: j.id, chunks: chunks)
+                // The listener may have moved on since the switch was asked for.
+                engine.send("prioritize", ["chunk": Timeline.chunk(containingWord: t.wordIndex(at: player.currentTime), in: chunks)])
+            } else if !showReader, let s = script {
+                let t = Timeline(title: s.title, voiceID: j.voiceID, quality: j.quality,
+                                 paragraphs: s.paragraphs.map { $0.components(separatedBy: " ") }, chunks: chunks, speed: s.speed)
+                try? openReader(t)
+            }
         case "chunk":
-            guard let t = timeline, let index = p["index"] as? Int, let path = p["path"] as? String else { return }
+            guard let index = p["index"] as? Int, let path = p["path"] as? String else { return }
             let words = (p["words"] as? [[Double]] ?? []).compactMap { $0.count == 2 ? (start: $0[0], end: $0[1]) : nil }
-            t.receive(index: index, url: URL(fileURLWithPath: path), duration: p["duration"] as? Double ?? 0, words: words)
-            player.chunkArrived(index)
+            let url = URL(fileURLWithPath: path), duration = p["duration"] as? Double ?? 0
+            if var sw = voiceSwitch, sw.job == j.id {
+                guard sw.chunks.indices.contains(index) else { return }
+                sw.chunks[index].url = url; sw.chunks[index].duration = duration; sw.chunks[index].words = words
+                voiceSwitch = sw
+                trySwitch()
+            } else if let t = timeline, t.chunks.indices.contains(index), !t.chunks[index].isReady {
+                t.receive(index: index, url: url, duration: duration, words: words)
+                player.chunkArrived(index)
+            }
         default:
             if let label = p["label"] as? String { progress.label = label; return }
             let done = p["done"] as? Int ?? 0, total = p["total"] as? Int ?? 0
@@ -577,16 +740,113 @@ final class AppModel {
         }
     }
 
+    // MARK: - Switching voices mid-book
+
+    /// Change the voice while listening. The new voice is narrated from where the listener is (then
+    /// the rest of the book, then the beginning), and takes over at the next natural break as soon as
+    /// that part exists — the old voice carries on until then, so there's no pause and no restart.
+    /// When it's done, the finished file is the new voice's.
+    func switchVoice(to id: String, quality requested: Quality) {
+        voiceID = id
+        if requested != quality { setQuality(requested) }
+        guard showReader, let t = timeline else { return }
+        let q: Quality = requested == .high && hq.isReady ? .high : .standard
+        if id == t.voiceID, q == t.quality {
+            // Back to the voice that's already playing: drop the switch in progress.
+            guard voiceSwitch != nil, let j = job else { return }
+            cancel(j); job = nil; voiceSwitch = nil; isGenerating = false
+            if !t.isComplete { startJob(voiceID: id, quality: q, startWord: currentWord(), switching: false) }
+            return
+        }
+        if script == nil, let n = narration ?? lastNarration {
+            // A reopened audiobook: narrate its own text again, saved next to it.
+            let stem = (n.name as NSString).deletingPathExtension.components(separatedBy: " – ").first ?? n.title
+            script = Script(title: n.title, paragraphs: t.paragraphs.map { $0.joined(separator: " ") },
+                            folder: (n.path as NSString).deletingLastPathComponent, stem: stem, speed: speed)
+        }
+        guard script != nil else { return }
+        if chunkDir == nil { chunkDir = FileManager.default.temporaryDirectory.appendingPathComponent("narrate-\(UUID().uuidString)") }
+        if let old = job { cancel(old) }
+        if q == .standard, t.quality == .high { engine.send("hq_unload") }   // queued ahead of the new job: frees ~7 GB
+        voiceSwitch = nil
+        if narration != nil { lastNarration = narration }
+        narration = nil                     // the finished file is the old voice; the new one is saved when done
+        let start = currentWord()
+        startJob(voiceID: id, quality: q, startWord: start, switching: true)
+        log.info("switchVoice: → \(id, privacy: .public) \(q.rawValue, privacy: .public) from word \(start)")
+    }
+    /// The last finished file, kept so a reopened audiobook can still be re-voiced after a first switch.
+    private var lastNarration: Narration?
+
+    private func cancel(_ j: Job) { engine.send("cancel", ["target": j.engineID]) }
+
+    private func currentWord() -> Int { timeline?.wordIndex(at: player.currentTime) ?? 0 }
+
+    /// New audio arrived for a pending switch: arm it if the part the listener is in now exists.
+    private func trySwitch() {
+        guard var sw = voiceSwitch, sw.armedWord == nil, let t = timeline else { return }
+        let words = t.words
+        guard !words.isEmpty else { return }
+        let g = currentWord()
+        var target = g
+        if player.isPlaying, !player.isWaiting {
+            // The next breath — a word after punctuation — within a few seconds, else the next word.
+            target = min(g + 1, words.count - 1)
+            for i in (g + 1)..<min(words.count, g + 20) where words[i - 1].last.map({ ".,;:!?".contains($0) }) == true {
+                target = i; break
+            }
+        }
+        let k = Timeline.chunk(containingWord: target, in: sw.chunks)
+        guard sw.chunks[k].isReady else { engine.send("prioritize", ["chunk": k]); return }
+        sw.armedWord = target
+        sw.armedTime = t.wordStarts()[target]
+        voiceSwitch = sw
+        switchTick()
+    }
+
+    /// Runs on the player's clock (30×/s) while a switch is armed.
+    private func switchTick() {
+        guard let sw = voiceSwitch, let target = sw.armedWord else { return }
+        let now = player.currentTime
+        if !player.isPlaying || player.isWaiting || abs(now - sw.armedTime) < 0.035 || (now > sw.armedTime && now - sw.armedTime < 0.5) {
+            performSwitch(at: !player.isPlaying || player.isWaiting ? currentWord() : target)
+        } else if now > sw.armedTime + 0.5 || now < sw.armedTime - 12 {
+            // The listener jumped somewhere else: pick a new moment from there.
+            voiceSwitch?.armedWord = nil
+            trySwitch()
+        }
+    }
+
+    private func performSwitch(at word: Int) {
+        guard let sw = voiceSwitch, let t = timeline, let j = job, j.id == sw.job else { return }
+        let k = Timeline.chunk(containingWord: word, in: sw.chunks)
+        guard sw.chunks.indices.contains(k), sw.chunks[k].isReady else { return }
+        voiceSwitch = nil
+        t.adopt(voiceID: j.voiceID, quality: j.quality, chunks: sw.chunks)
+        let starts = t.wordStarts()
+        let at = starts.indices.contains(word) ? starts[word] : 0
+        player.reload(at: max(0, at - 0.03))
+        log.info("switchVoice: now speaking \(j.voiceID, privacy: .public) at word \(word)")
+    }
+
     func cleanupChunks() {
         if let d = chunkDir { try? FileManager.default.removeItem(at: d) }
         chunkDir = nil
     }
 
-    func cancelGeneration() { engine.cancelCurrent() }
+    func cancelGeneration() {
+        if let j = job { cancel(j) } else { engine.cancelCurrent() }
+    }
 
     /// The listener skipped somewhere that isn't synthesized yet: make the engine go there next.
     private func prioritize(chunk: Int) {
         guard isGenerating else { return }
+        if let sw = voiceSwitch, let t = timeline {
+            // Still on the old voice: what matters is the new voice's chunk for that spot.
+            let g = t.wordIndex(at: t.offsets.indices.contains(chunk) ? t.offsets[chunk] : 0)
+            engine.send("prioritize", ["chunk": Timeline.chunk(containingWord: g, in: sw.chunks)])
+            return
+        }
         engine.send("prioritize", ["chunk": chunk])
     }
 
@@ -594,6 +854,7 @@ final class AppModel {
 
     private func openReader(_ t: Timeline) throws {
         player.onNeedChunk = { [weak self] k in self?.prioritize(chunk: k) }
+        player.onTick = { [weak self] in self?.switchTick() }
         player.load(t)
         timeline = t
         showReader = true
@@ -618,10 +879,13 @@ final class AppModel {
 
     func closeReader() {
         player.stop()
-        if isGenerating { engine.cancelCurrent() }
+        if isGenerating { cancelGeneration() }
+        voiceSwitch = nil
         showReader = false
         timeline = nil
         narration = nil
+        lastNarration = nil
+        script = nil
         if !isGenerating { cleanupChunks() }
     }
 

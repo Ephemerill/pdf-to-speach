@@ -33,7 +33,11 @@ struct HomeView: View {
 
                 if let doc = model.document { DocumentCard(doc: doc) }
 
-                Section("Voice") { VoiceRow() }
+                Section("Voice") {
+                    VoicesDownloadStatus()
+                    VoiceRow()
+                    QualityPicker()
+                }
 
                 // 1× MP3 is what nearly everyone wants, so these stay folded away until needed.
                 Section {
@@ -48,16 +52,15 @@ struct HomeView: View {
                             ForEach(model.formats, id: \.self) { Text($0.uppercased()).tag($0) }
                         }
                         .pickerStyle(.segmented).frame(maxWidth: 220)
+                        HQStorageRow()
                         LabeledContent("Updates") {
                             HStack(spacing: 12) {
                                 @Bindable var updater = model.updater
                                 Toggle("Check automatically", isOn: $updater.automatic).toggleStyle(.checkbox)
                                 Spacer()
                                 Text("v\(Updater.currentVersion)").foregroundStyle(.tertiary).monospacedDigit()
-                                Button(model.updater.state == .checking ? "Checking…" : "Check Now") {
-                                    Task { await model.updater.check(interactive: true) }
-                                }
-                                .controlSize(.small).disabled(model.updater.isBusy)
+                                Button("Check Now") { model.updater.check() }
+                                    .controlSize(.small).disabled(!model.updater.canCheck)
                             }
                         }
                     } label: {
@@ -76,12 +79,12 @@ struct HomeView: View {
             .contentMargins(.bottom, 96, for: .scrollContent)   // room to scroll clear of the floating action
         }
         .overlay(alignment: .bottom) { footer }
-        .overlay(alignment: .top) { UpdateBanner().padding(.top, 10) }
         .background(.background)
         .dropDestination(for: URL.self) { urls, _ in
             model.open(urls); return true
         } isTargeted: { isDropTargeted = $0 }
         .toolbar {
+            ToolbarItem(placement: .primaryAction) { HQDownloadChip() }
             ToolbarItem(placement: .primaryAction) { StatusPill(status: model.status) }
         }
         .overlay(alignment: .bottom) { ToastView(toast: model.toast).padding(.bottom, 100) }
@@ -90,7 +93,7 @@ struct HomeView: View {
 
     private var isSetupSheetShown: Bool {
         switch model.status {
-        case .downloading, .failed: return true
+        case .failed: return true
         default: return false
         }
     }
@@ -212,6 +215,16 @@ struct HomeView: View {
                 .padding(.horizontal, 16).padding(.vertical, 12)
                 .frame(maxWidth: 520)
                 .glassPanel(cornerRadius: 16)
+            } else if model.generateWhenReady, model.canQueueGeneration {
+                HStack(spacing: 10) {
+                    ProgressView(value: model.status == .downloading ? model.kokoro.fraction : nil).progressViewStyle(.circular).controlSize(.small)
+                    Text("Starts as soon as the voices are ready").font(.callout)
+                    Spacer()
+                    Button("Cancel", role: .cancel) { model.generateWhenReady = false }.controlSize(.small)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 12)
+                .frame(maxWidth: 520)
+                .glassPanel(cornerRadius: 16)
             } else {
                 Button {
                     model.generate()
@@ -223,11 +236,13 @@ struct HomeView: View {
                 }
                 .prominentGlassButton().controlSize(.large)
                 .keyboardShortcut(.return, modifiers: .command)
-                .disabled(!model.canGenerate)
+                .disabled(!model.canGenerate && !model.canQueueGeneration)
+                .help(model.canQueueGeneration ? "The voices are still downloading — press to start as soon as they're ready" : "")
             }
         }
         .padding(.horizontal, 20).padding(.bottom, 18)
         .animation(.snappy, value: model.isGenerating)
+        .animation(.snappy, value: model.generateWhenReady)
     }
 }
 
@@ -289,6 +304,18 @@ struct PageSelectionSection: View {
                     .help("Flip through the PDF and mark the pages to narrate")
             }
             .controlSize(.small)
+
+            Toggle(isOn: $model.skipNotes) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Skip page numbers & footnotes")
+                    Text(model.skipNotes
+                         ? (doc.skippedWords > 0 ? "Leaving out \(doc.skippedWords.formatted()) words of notes, page numbers and running heads"
+                                                 : "Nothing to leave out on these pages")
+                         : "Everything on the page is read, notes included")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .help("Footnotes, the little note numbers in the text, page numbers and running headers are detected from the layout and left out of the narration")
 
             if !doc.outline.isEmpty {
                 DisclosureGroup(isExpanded: $showChapters) {
@@ -369,6 +396,7 @@ struct GradeBadge: View {
 }
 
 struct StatusPill: View {
+    @Environment(AppModel.self) private var model
     let status: AppModel.Status
 
     var body: some View {
@@ -386,52 +414,11 @@ struct StatusPill: View {
     private var text: String {
         switch status {
         case .starting: return "Starting…"
-        case .downloading(_, let f): return "Downloading model \(Int(f * 100))%"
-        case .loading: return "Loading voice…"
+        case .downloading: return "Downloading voices \(Int(model.kokoro.fraction * 100))%"
+        case .loading: return "Loading voices…"
         case .ready: return "Ready"
         case .failed: return "Engine error"
         }
-    }
-}
-
-/// A small pill at the top of the setup screen while a newer release is available or installing.
-struct UpdateBanner: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        let u = model.updater
-        Group {
-            switch u.state {
-            case .available(let r):
-                HStack(spacing: 10) {
-                    Image(systemName: "arrow.down.circle.fill").foregroundStyle(Color.accentColor)
-                    Text("Narrate \(r.version) is available").font(.callout)
-                    Button("What's New") { NSWorkspace.shared.open(r.pageURL) }.buttonStyle(.link).font(.callout)
-                    Button("Update") { u.install() }
-                        .prominentGlassButton().controlSize(.small)
-                        .disabled(model.isGenerating)
-                        .help(model.isGenerating ? "Wait for the current audiobook to finish" : "Download and relaunch as \(r.version)")
-                    Button { u.skip() } label: { Image(systemName: "xmark").font(.caption.weight(.semibold)) }
-                        .buttonStyle(.plain).foregroundStyle(.secondary).help("Not now")
-                }
-            case .downloading(let f):
-                HStack(spacing: 10) {
-                    ProgressView(value: f).progressViewStyle(.linear).frame(width: 140)
-                    Text("Downloading update… \(Int(f * 100))%").font(.callout).monospacedDigit()
-                }
-            case .installing:
-                HStack(spacing: 10) {
-                    ProgressView().controlSize(.small)
-                    Text("Installing — Narrate will reopen in a moment").font(.callout)
-                }
-            default:
-                EmptyView()
-            }
-        }
-        .padding(.horizontal, 14).padding(.vertical, 8)
-        .glassPanel(cornerRadius: 12)
-        .transition(.move(edge: .top).combined(with: .opacity))
-        .animation(.snappy, value: u.state)
     }
 }
 
@@ -466,7 +453,8 @@ struct ToastView: View {
     }
 }
 
-/// First-launch model download (and any engine failure) — a sheet so it's impossible to miss.
+/// An engine failure — a sheet so it's impossible to miss. (The first-launch voice download is not
+/// a sheet any more: it runs in the background, see `VoicesDownloadStatus`.)
 struct SetupSheet: View {
     @Environment(AppModel.self) private var model
 
@@ -475,12 +463,6 @@ struct SetupSheet: View {
             Image(systemName: "waveform.circle.fill")
                 .font(.system(size: 44)).foregroundStyle(Color.accentColor)
             switch model.status {
-            case .downloading(let label, let frac):
-                Text("Setting up Narrate").font(.title2.weight(.semibold))
-                Text("Downloading the Kokoro voice model (340 MB). This only happens once, and everything runs on your Mac afterwards — nothing you narrate ever leaves it.")
-                    .multilineTextAlignment(.center).foregroundStyle(.secondary)
-                ProgressView(value: frac).progressViewStyle(.linear)
-                Text("\(label) · \(Int(frac * 100))%").font(.caption).foregroundStyle(.secondary).monospacedDigit()
             case .failed(let message):
                 Text("Something went wrong").font(.title2.weight(.semibold))
                 Text(message).multilineTextAlignment(.center).foregroundStyle(.secondary).textSelection(.enabled)

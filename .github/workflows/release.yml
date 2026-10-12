@@ -1,19 +1,12 @@
-# Builds Narrate.dmg on a Mac runner and publishes it as a GitHub Release.
+# CI build: Actions ▸ Build ▸ Run workflow → an (ad hoc signed) DMG as a downloadable artifact.
 #
-#   git tag v2.1 && git push origin v2.1     → release "Narrate v2.1" with the DMG attached
-#   Actions ▸ Release ▸ Run workflow          → just builds the DMG (downloadable as an artifact)
-#
-# Signing/notarization: add SIGN_IDENTITY / NOTARY_PROFILE support by importing a Developer ID
-# certificate into the runner keychain (see README "Shipping without the Gatekeeper prompt").
-name: Release
+# Releases are NOT made here any more: since 2.5 they're Developer ID signed, notarized and listed in
+# the Sparkle appcast, which needs the signing certificate, the notary credentials and the Sparkle
+# EdDSA key — all of which live on the release Mac. Run ./release.sh there instead.
+name: Build
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
@@ -21,45 +14,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache embedded Python + wheels
+      - name: Cache embedded Python + wheels, and Sparkle
         uses: actions/cache@v4
         with:
-          path: build/python-arm64
-          key: python-arm64-${{ hashFiles('engine/requirements.txt', 'build.sh') }}
+          path: |
+            build/python3.13-arm64
+            build/sparkle-*
+          key: build-arm64-${{ hashFiles('engine/requirements.txt', 'build.sh') }}
 
       - name: Build disk image
         run: ./build.sh --dmg
-
-      - name: Keep a stable file name for the "latest" link
-        run: cp dist/Narrate-*-arm64.dmg dist/Narrate.dmg
-
-      - name: Zip the app for in-app updates
-        run: ditto -c -k --keepParent dist/Narrate.app dist/Narrate.zip
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: Narrate-dmg
-          path: |
-            dist/*.dmg
-            dist/Narrate.zip
-
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          cat > notes.md <<'NOTES'
-          ## Install
-          Download **Narrate.dmg** below, open it, and drag Narrate onto Applications. Apple Silicon, macOS 15+.
-
-          First launch downloads the voice model (≈340 MB, once). Everything runs on your Mac; nothing leaves it.
-
-          **First open:** macOS will say *"Apple could not verify Narrate is free of malware"* because this build
-          isn't notarized yet. Click **Done**, open **System Settings ▸ Privacy & Security**, scroll down and click
-          **Open Anyway**. You only do this once — after that Narrate updates itself from here
-          (Narrate ▸ Check for Updates…, or automatically once a day; turn that off under Options).
-          `Narrate.zip` is what the in-app updater downloads.
-          NOTES
-          gh release create "$GITHUB_REF_NAME" dist/Narrate-*-arm64.dmg dist/Narrate.dmg dist/Narrate.zip \
-            --title "Narrate $GITHUB_REF_NAME" --notes-file notes.md --generate-notes
+          path: dist/*.dmg

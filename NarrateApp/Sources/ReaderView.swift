@@ -18,6 +18,7 @@ struct ReaderView: View {
                 Button { model.closeReader() } label: { Label("New Document", systemImage: "chevron.left") }
                     .help(model.isGenerating ? "Stop and go back" : "Back to start")
             }
+            ToolbarItem(placement: .primaryAction) { HQDownloadChip() }
             ToolbarItemGroup(placement: .primaryAction) {
                 let done = model.narration != nil
                 let waiting = "Available once the audiobook is finished"
@@ -75,11 +76,8 @@ struct PlayerBar: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(timeline.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                Text(timeline.voice + (model.narration.map { " · \($0.format)" } ?? "")).font(.caption).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: 240, alignment: .leading)
+            ReaderVoiceButton(timeline: timeline)
+                .frame(maxWidth: 240, alignment: .leading)
 
             Spacer(minLength: 8)
 
