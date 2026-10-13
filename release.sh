@@ -72,8 +72,9 @@ def md_to_html(md: str) -> str:
     out, in_list = [], False
     for line in md.splitlines():
         line = line.rstrip()
-        text = html.escape(line.lstrip("-#* ").strip())
+        text = html.escape(re.sub(r"^(#+|[-*])\s+", "", line).strip())   # list marker / heading hashes only
         text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+        text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
         if line.startswith(("- ", "* ")):
             if not in_list: out.append("<ul>"); in_list = True
             out.append(f"<li>{text}</li>"); continue
@@ -122,7 +123,8 @@ git worktree remove --force "$WT"
 
 # First release through Pages: switch Pages on for the branch.
 gh api "repos/$REPO/pages" >/dev/null 2>&1 || \
-  gh api -X POST "repos/$REPO/pages" -f "source[branch]=gh-pages" -f "source[path]=/" >/dev/null
+  gh api -X POST "repos/$REPO/pages" -f "source[branch]=gh-pages" -f "source[path]=/" >/dev/null 2>&1 || \
+  gh api "repos/$REPO/pages" >/dev/null   # the POST can succeed yet trip gh's JSON parsing
 
 echo "✓ Narrate $VERSION released: https://github.com/$REPO/releases/tag/$TAG"
 echo "  Appcast: $PAGES/appcast.xml (Pages can take a minute to publish)"
