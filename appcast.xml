@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Narrate</title>
+    <link>https://ephemerill.github.io/pdf-to-speach/appcast.xml</link>
+    <description>Updates for Narrate</description>
+    <language>en</language>
+    <item>
+      <title>Narrate 2.5</title>
+      <pubDate>Tue, 13 Oct 2026 07:36:34 GMT</pubDate>
+      <sparkle:version>7</sparkle:version>
+      <sparkle:shortVersionString>2.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <description><![CDATA[
+<h3>High quality voices</h3>
+<ul>
+<li>New <b>High Quality</b> option, powered by Fish Audio S2 Pro: far more natural reading, still entirely on your Mac and free. Every voice has a high quality version.</li>
+<li>The model (6.7 GB) only downloads when you choose High Quality, in the background, with progress shown, and the app stays usable meanwhile. Delete it any time under Options to get the space back.</li>
+<li>It generates faster than it plays (about 2× real time on an M2 Pro), so you can listen while it works; the first words take about 20 seconds. It needs about 8 GB of memory while speaking.</li>
+</ul>
+<h3>Smarter PDF reading</h3>
+<ul>
+<li>Skips page numbers, running headers and footnotes** (and the little note numbers in the text) by default. Turn it off per document under *Pages to narrate* to hear everything.</li>
+</ul>
+<h3>Change voices while listening</h3>
+<ul>
+<li>Pick another voice (or quality) from the voice button in the player. It takes over from the very spot you&#x27;re at, at the next pause — within a couple of seconds for standard voices, about half a minute for High Quality — while the rest is redone in the background.</li>
+</ul>
+<h3>Everything else</h3>
+<ul>
+<li>First launch no longer waits for the voice download: open documents and choose pages while it finishes.</li>
+<li>Updates now come through Sparkle, and Narrate is signed with a Developer ID and notarized by Apple, so no more &quot;Open Anyway&quot; in Privacy &amp; Security.</li>
+</ul>
+      ]]></description>
+      <enclosure url="https://github.com/Ephemerill/pdf-to-speach/releases/download/v2.5/Narrate.zip" type="application/octet-stream" sparkle:edSignature="imMNNX3tbKhVG+xcSMazP2dRppQuRmmf2sLWJFv4reLo1Z03WDct/n/N8n73oT7s6b49AYtaROQQZf5gg6YABQ==" length="161375209" />
+    </item>
+  </channel>
+</rss>
