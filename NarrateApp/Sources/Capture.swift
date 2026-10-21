@@ -255,7 +255,8 @@ enum Capture {
     }
 
     /// Reconstruct reading order: detect 2-column layouts, split paragraphs on vertical gaps.
-    static func linesToParagraphs(_ input: [Line]) -> [String] {
+    /// `clean: false` keeps running heads, page numbers and footnotes (the literal reading).
+    static func linesToParagraphs(_ input: [Line], clean: Bool = true) -> [String] {
         if input.isEmpty { return [] }
         var lines = input.sorted { $0.y < $1.y }
         let medH = median(lines.map(\.h))
@@ -271,7 +272,7 @@ enum Capture {
             return false
         }
 
-        if lines.count >= 6 {
+        if clean, lines.count >= 6 {
             let kept = lines.filter { !isFurniture($0) }
             lines = kept.isEmpty ? lines : kept
             lines = stripFootnotes(lines)

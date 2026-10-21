@@ -104,7 +104,7 @@ class Engine:
         doc = pdf_text.extract(req["path"], req.get("first"), req.get("last"),
                                progress=lambda label: self.progress(rid, label=label))
         return {"name": doc.name, "path": doc.path, "pages": doc.pages, "page_blocks": doc.page_blocks,
-                "page_blocks_all": doc.page_blocks_all,
+                "page_blocks_all": doc.page_blocks_all, "scanned_pages": doc.scanned_pages,
                 "outline": [s.__dict__ for s in doc.outline], "outline_source": doc.outline_source}
 
     def backend(self, req, rid=None):

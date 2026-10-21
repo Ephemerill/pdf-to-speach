@@ -267,16 +267,28 @@ final class AppModel {
                 let r = try await engine.call("extract", ["path": url.path]) { p in
                     if let label = p["label"] as? String { Task { @MainActor in self.extractLabel = label } }
                 }
-                let blocks = r["page_blocks"] as? [[String]] ?? []
-                guard blocks.contains(where: { !$0.isEmpty }) || (r["page_blocks_all"] as? [[String]] ?? []).contains(where: { !$0.isEmpty }) else {
-                    showToast("No readable text found. This PDF looks like scanned images.", isError: true); return
+                var blocks = r["page_blocks"] as? [[String]] ?? []
+                var allBlocks = r["page_blocks_all"] as? [[String]] ?? []
+                // Pages that are only pictures (a scan): read them with on-device OCR.
+                let scanned = (r["scanned_pages"] as? [Int] ?? []).filter { blocks.indices.contains($0 - 1) }
+                if !scanned.isEmpty {
+                    let name = url.lastPathComponent
+                    let found = await PDFScan.ocr(path: url.path, pages: scanned) { done, total in
+                        Task { @MainActor in self.extractLabel = "Reading scanned pages of \(name)… \(done + 1) of \(total)" }
+                    }
+                    if allBlocks.count != blocks.count { allBlocks = blocks }
+                    for (p, page) in found { blocks[p - 1] = page.clean; allBlocks[p - 1] = page.all }
+                }
+                guard blocks.contains(where: { !$0.isEmpty }) || allBlocks.contains(where: { !$0.isEmpty }) else {
+                    showToast(scanned.isEmpty ? "No readable text found in that PDF."
+                                              : "No readable text found — the scanned pages couldn't be read.", isError: true); return
                 }
                 let outline = (r["outline"] as? [[String: Any]] ?? []).enumerated().map { i, e in
                     OutlineEntry(id: i, title: e["title"] as? String ?? "Untitled", level: e["level"] as? Int ?? 1,
                                  first: e["first"] as? Int ?? 1, last: e["last"] as? Int ?? 1)
                 }
                 setDocument(SourceDocument(pdfName: r["name"] as? String ?? url.lastPathComponent, path: url.path,
-                                           pageBlocks: blocks, allBlocks: r["page_blocks_all"] as? [[String]], outline: outline,
+                                           pageBlocks: blocks, allBlocks: allBlocks, outline: outline,
                                            outlineSource: r["outline_source"] as? String ?? "none"))
                 if !outline.isEmpty, blocks.count > 30 {
                     showToast("Found \(outline.count) chapters — tick the ones you want, or choose pages.", isError: false)

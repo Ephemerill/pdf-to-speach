@@ -37,6 +37,7 @@ class Document:
     page_blocks_all: list[list[str]] = field(default_factory=list)   # everything, read literally
     outline: list[Section] = field(default_factory=list)
     outline_source: str = "none"                # "bookmarks" | "headings" | "none"
+    scanned_pages: list[int] = field(default_factory=list)   # 1-based pages that are pictures with no text layer
 
     @property
     def paragraphs(self) -> list[str]:
@@ -388,6 +389,7 @@ def extract(path: str, first_page: int | None = None, last_page: int | None = No
     pages: list[list[_Block]] = []
     rules: list[float | None] = []
     heights: list[float] = []
+    scanned: list[int] = []
     for pno in range(start - 1, end):
         if progress and (pno - start + 1) % 25 == 0:
             progress(f"Reading page {pno + 1} of {end}…")
@@ -396,6 +398,12 @@ def extract(path: str, first_page: int | None = None, last_page: int | None = No
             blocks = _read_blocks(page)
         except Exception:  # noqa: BLE001 — a malformed page shouldn't sink the whole book
             blocks = []
+        if not blocks:
+            try:
+                if page.get_images():
+                    scanned.append(pno + 1)
+            except Exception:  # noqa: BLE001
+                pass
         pages.append(blocks)
         rules.append(_note_rule(page) if blocks else None)
         heights.append(page.rect.height)
@@ -422,4 +430,4 @@ def extract(path: str, first_page: int | None = None, last_page: int | None = No
     return Document(name=os.path.basename(path), path=path, pages=total,
                     page_blocks=pad_before + clean_pages + pad_after,
                     page_blocks_all=[[] for _ in range(start - 1)] + full_pages + [[] for _ in range(end, total)],
-                    outline=outline, outline_source=source)
+                    outline=outline, outline_source=source, scanned_pages=scanned)
